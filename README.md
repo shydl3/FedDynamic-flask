@@ -12,24 +12,24 @@ Course project for CS230 implementing a federated learning system with dynamic c
 
 ## Installation
 
-```bash
+```
 # Install required dependencies
 pip install flwr torch torchvision
-```bash
+```
 
 ## Running the Project
 
 # server
 Start the central server:
 
-```bash
+```
 python server.py
-```bash
+```
 
 ## Clients
 Run each client in separate terminals:
 
-```bash
+```
 # Terminal 1
 python client1.py
 
@@ -38,7 +38,7 @@ python client2.py
 
 # Terminal 3
 python client3.py
-```bash
+```
 
 ## Project Structure
 server.py: Implements the federated server logic
