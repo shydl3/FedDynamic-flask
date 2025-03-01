@@ -41,6 +41,6 @@ python client3.py
 ```
 
 ## Project Structure
-server.py: Implements the federated server logic
-client1.py, client2.py, client3.py: Client implementations with identical code but different instance files
+- server.py: Implements the federated server logic
+- client1.py, client2.py, client3.py: Client implementations with identical code but different instance files
 
