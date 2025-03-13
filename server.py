@@ -79,12 +79,13 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
     def initialize_clients(self, client_manager):
         """Initialize all available clients at the beginning"""
         available_clients = client_manager.all()
-        global_metrics["expected_clients"] = set([client.cid for client in available_clients])
+        
+        # In Flower, client_manager.all() returns the client IDs directly as strings
+        global_metrics["expected_clients"] = set(available_clients)  # Fixed this line
         
         print(f"Initial clients registered: {global_metrics['expected_clients']}")
         
-        for client in available_clients:
-            client_id = client.cid
+        for client_id in global_metrics["expected_clients"]:
             # Initialize client status
             if client_id not in global_metrics["client_status"]:
                 global_metrics["client_status"][client_id] = {
@@ -111,23 +112,30 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         
         # Process results for global metrics
         if results:
-            # Convert parameters for evaluation
-            parameters_aggregated, _ = super().aggregate_fit(server_round, results, [])
-            if parameters_aggregated is not None:
-                ndarrays = fl.common.parameters_to_ndarrays(parameters_aggregated)
-                
-                # Evaluate global model
-                loss, accuracy = evaluate_global_model(ndarrays)
-                
-                # Store metrics
-                global_metrics["loss"].append(loss)
-                global_metrics["accuracy"].append(accuracy)
-                
-                # Store weight evolution (mean of first layer)
-                if len(ndarrays) > 0:
-                    global_metrics["weights_evolution"].append(float(np.mean(ndarrays[0])))
-                
-                print(f"📊 Round {server_round}: Loss={loss:.4f}, Accuracy={accuracy:.4f}")
+            # Check if we have valid examples to prevent division by zero
+            num_examples_total = sum(fit_res.num_examples for _, fit_res in results)
+            
+            if num_examples_total > 0:
+                # Convert parameters for evaluation
+                try:
+                    parameters_aggregated, _ = super().aggregate_fit(server_round, results, failures)  # Pass actual failures
+                    if parameters_aggregated is not None:
+                        ndarrays = fl.common.parameters_to_ndarrays(parameters_aggregated)
+                        
+                        # Evaluate global model
+                        loss, accuracy = evaluate_global_model(ndarrays)
+                        
+                        # Store metrics
+                        global_metrics["loss"].append(loss)
+                        global_metrics["accuracy"].append(accuracy)
+                        
+                        # Store weight evolution (mean of first layer)
+                        if len(ndarrays) > 0:
+                            global_metrics["weights_evolution"].append(float(np.mean(ndarrays[0])))
+                        
+                        print(f"📊 Round {server_round}: Loss={loss:.4f}, Accuracy={accuracy:.4f}")
+                except ZeroDivisionError:
+                    print(f"⚠️ Warning: Division by zero in round {server_round}, no valid examples for aggregation")
         
         # Record successful clients
         for client_proxy, fit_res in results:
@@ -251,8 +259,8 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         # Get all clients and their configuration
         config = {}
         
-        # Get available client IDs for this round
-        available_clients = [client.cid for client in client_manager.all()]
+        # Get available client IDs for this round (these are already strings)
+        available_clients = client_manager.all()  # Fixed: directly use the strings
         
         # Update expected clients set
         global_metrics["expected_clients"].update(available_clients)
