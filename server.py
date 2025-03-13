@@ -155,19 +155,23 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         
         return parameters_aggregated, metrics
     
-    def configure_fit(
-        self, server_round: int, parameters, client_manager
-    ):
+    def configure_fit(self, server_round, parameters, client_manager):
         """Configure clients for training - handle rejoining clients"""
         
         # Get all clients and their configuration
         config = {}
         
-        # Get all available client IDs
-        available_clients = [client.cid for client in client_manager.all()]
+        # Get available client IDs
+        available_clients = client_manager.all()
         
         # Check if any clients rejoined after failure
         for client_id, status in global_metrics["client_status"].items():
+            # Make sure the status dictionary has the required keys
+            if "active" not in status:
+                status["active"] = True
+            if "missed_rounds" not in status:
+                status["missed_rounds"] = 0
+            
             if status["active"] == False and client_id in available_clients:
                 # Client is rejoining
                 missed_rounds = status["missed_rounds"]
