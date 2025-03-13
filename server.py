@@ -41,17 +41,20 @@ def evaluate_global_model(parameters):
     model.eval()
     correct, total = 0, 0
     loss = 0.0
+    criterion = torch.nn.CrossEntropyLoss()
     
     with torch.no_grad():
         for data, target in testloader:
             data, target = data.to(device), target.to(device)
             outputs = model(data)
+            loss += criterion(outputs, target).item() * data.size(0)
             _, predicted = torch.max(outputs, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
     
+    average_loss = loss / total
     accuracy = correct / total
-    return 0.0, accuracy  # Dummy loss, actual accuracy
+    return average_loss, accuracy
 
 # Custom aggregation strategy
 class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
