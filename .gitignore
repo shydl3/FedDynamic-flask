@@ -1,0 +1,7 @@
+.venv/
+data/
+__pycache__/
+.vscode/
+client_states/
+results/
+*.png

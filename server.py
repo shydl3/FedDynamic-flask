@@ -1,3 +1,6 @@
+# server.py
+import os
+import argparse
 import flwr as fl
 import numpy as np
 import matplotlib.pyplot as plt
@@ -5,213 +8,257 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 from model import Net
+from collections import defaultdict
 
-# 记录全局模型损失和准确率
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description="Federated Learning Server")
+parser.add_argument("--rounds", type=int, default=10, help="Number of federated learning rounds")
+parser.add_argument("--min-clients", type=int, default=1, help="Minimum number of clients to start a round")
+parser.add_argument("--port", type=int, default=8080, help="Server port")
+args = parser.parse_args()
+
+# Create directory for results
+os.makedirs("results", exist_ok=True)
+
+# Global variables for tracking metrics
 global_loss = []
 global_acc = []
 weights_over_time = []
-client_contributions = {}
+client_contributions = defaultdict(list)
+client_status = {}  # Track client status (active/failed)
 
-# 评估全局模型
+# Evaluate global model on test dataset
 def evaluate_global_model(parameters):
-    """在本地 MNIST 测试集上评估全局模型"""
+    """Evaluate the global model on the MNIST test dataset"""
+    # Device configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Initialize model
     model = Net().to(device)
-
-    # 加载服务器端聚合后的模型参数
+    
+    # Load parameters into model
     params_dict = zip(model.state_dict().keys(), parameters)
     state_dict = {k: torch.tensor(v) for k, v in params_dict}
     model.load_state_dict(state_dict, strict=True)
-
-    # 加载 MNIST 测试数据集
+    
+    # Load test dataset
     transform = transforms.Compose([transforms.ToTensor()])
     testset = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
-    test_loader = torch.utils.data.DataLoader(testset, batch_size=32, shuffle=False)
-
+    testloader = torch.utils.data.DataLoader(testset, batch_size=32, shuffle=False)
+    
+    # Evaluate model
     model.eval()
     loss_fn = torch.nn.CrossEntropyLoss()
     correct, total, loss = 0, 0, 0.0
-
+    
     with torch.no_grad():
-        for images, labels in test_loader:
+        for images, labels in testloader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             loss += loss_fn(outputs, labels).item()
             _, predicted = torch.max(outputs, 1)
-            correct += (predicted == labels).sum().item()
             total += labels.size(0)
-
-    acc = correct / total
-    avg_loss = loss / len(test_loader)
+            correct += (predicted == labels).sum().item()
     
-    global_loss.append(avg_loss)
-    global_acc.append(acc)
+    accuracy = correct / total
+    avg_loss = loss / len(testloader)
     
-    return avg_loss, acc
+    return avg_loss, accuracy
 
-# 自定义 FedAvg 以进行可视化
-class CustomFedAvg(fl.server.strategy.FedAvg):
+# Custom Federated Averaging Strategy
+class FedAvgWithFailures(fl.server.strategy.FedAvg):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # 初始化跟踪客户端首次加入轮次的字典
-        self.client_first_round = {}
-        # 保持原有的客户端贡献跟踪
-        # 保持原有的权重变化跟踪
-        self.weights_over_time = []
-        self.rnd = 0
-        
-    def aggregate_fit(self, rnd, results, failures):
-        """联邦训练轮次聚合"""
+        self.client_first_round = {}  # Track when each client first joined
+        self.client_last_round = {}   # Track the last round each client participated
+        self.client_properties = {}   # Track client properties
+    
+    def aggregate_fit(self, server_round, results, failures):
+        """Aggregate client results and handle failures"""
         if not results:
-            return super().aggregate_fit(rnd, results, failures)
-
-        new_clients = []
-        for res in results:
-            client_id = res[0].cid
-            if client_id not in self.client_first_round:
-                self.client_first_round[client_id] = rnd
-                new_clients.append(client_id)
-
-        if new_clients:
-            print(f"🔔 Round {rnd} - New clients joined: {new_clients}")
-            print(f"🔔 Total clients so far: {len(self.client_first_round)}")
-
+            print(f"⚠️ Round {server_round} - No clients returned results")
+            return None, {}
+        
+        if failures:
+            print(f"⚠️ Round {server_round} - {len(failures)} clients failed")
+            for failure in failures:
+                if isinstance(failure, tuple) and len(failure) > 0:
+                    client_id = failure[0].cid
+                    client_status[client_id] = "failed"
+                    print(f"Client {client_id} failed")
+        
+        # Process client results with weighted aggregation
         weighted_results = []
         total_weight = 0.0
-        for res in results:
-            client_id = res[0].cid
-            # 计算客户端参与的轮次数
-            participation_rounds = rnd - self.client_first_round[client_id] + 1
-            # 使用对数函数使权重增长更加平滑
-            weight = np.log2(participation_rounds + 1)
+        
+        for client, fit_res in results:
+            client_id = client.cid
+            client_status[client_id] = "active"
+            
+            # Track first participation
+            if client_id not in self.client_first_round:
+                self.client_first_round[client_id] = server_round
+                print(f"New client joined: {client_id}")
+            
+            # Calculate missed rounds
+            missed_rounds = 0
+            if client_id in self.client_last_round:
+                missed_rounds = server_round - self.client_last_round[client_id] - 1
+            
+            # Update last active round
+            self.client_last_round[client_id] = server_round
+            
+            # Store client information
+            dataset_size = fit_res.num_examples
+            self.client_properties[client_id] = {"dataset_size": dataset_size}
+            
+            # Calculate weight based on dataset size and missed rounds
+            weight = dataset_size
+            if missed_rounds > 0:
+                # Apply penalty for missed rounds: exp(-missed/5)
+                missed_round_penalty = np.exp(-missed_rounds / 5)
+                weight = weight * missed_round_penalty
+                print(f"Client {client_id}: {dataset_size} samples, missed {missed_rounds} rounds, weight={weight:.2f}")
+            else:
+                print(f"Client {client_id}: {dataset_size} samples, no missed rounds, weight={weight:.2f}")
+            
             total_weight += weight
+            weighted_results.append((client, fit_res, weight))
             
-            weighted_results.append((res[0], res[1], weight))
+            # Track contribution for visualization
+            parameters = fl.common.parameters_to_ndarrays(fit_res.parameters)
+            norm = np.linalg.norm(np.concatenate([p.flatten() for p in parameters]))
+            
+            # Fill missing rounds with zeros
+            while len(client_contributions[client_id]) < server_round - 1:
+                client_contributions[client_id].append(0.0)
+            
+            # Add current contribution
+            client_contributions[client_id].append(norm)
         
+        # Normalize weights
         if total_weight > 0:
-            weighted_results = [
-                (res[0], res[1], res[2] / total_weight) for res in weighted_results
-            ]
+            weighted_results = [(client, fit_res, weight / total_weight) 
+                               for client, fit_res, weight in weighted_results]
         
-        # 使用自定义权重聚合参数
-        aggregated_parameters = self.aggregate_parameters_weighted(
-            [
-                (fl.common.parameters_to_ndarrays(res[1].parameters), res[2])
-                for res in weighted_results
-            ]
-        )
-
-        if aggregated_parameters:
-            # 评估全局模型
-            loss, acc = evaluate_global_model(aggregated_parameters)
-            print(f"Round {rnd} - Loss: {loss:.4f}, Accuracy: {acc:.4f}")
+        # Aggregate parameters
+        parameters_aggregated = self._aggregate_fit_params(weighted_results)
+        
+        if parameters_aggregated is not None:
+            # Evaluate global model
+            loss, acc = evaluate_global_model(fl.common.parameters_to_ndarrays(parameters_aggregated))
+            print(f"📊 Round {server_round} - Global model evaluation: Loss={loss:.4f}, Accuracy={acc:.4f}")
             
-            # 记录权重变化
-            mean_weight = np.mean(aggregated_parameters[0])
-            self.weights_over_time.append(mean_weight)
+            # Record metrics for visualization
+            global_loss.append(loss)
+            global_acc.append(acc)
             
-            # 记录客户端贡献
-            for res in results:
-                client_id = res[0].cid
-                client_parameters = fl.common.parameters_to_ndarrays(res[1].parameters)
-                norm = np.linalg.norm(np.concatenate([p.flatten() for p in client_parameters]))
-                if client_id not in client_contributions:
-                    client_contributions[client_id] = []
-                if len(client_contributions[client_id]) != self.rnd:
-                    missing_rounds = rnd - len(client_contributions[client_id]) -1
-                    if missing_rounds > 0: 
-                        # 使用0或平均值填充缺失的轮次
-                        fill_value = 0.0  # 或者使用平均值: np.mean(self.client_contributions[client_id])
-                        client_contributions[client_id].extend([fill_value] * missing_rounds)
-                client_contributions[client_id].append(norm)
-                
-        self.rnd += 1
-
-        return fl.common.Parameters(
-            tensors=fl.common.ndarrays_to_parameters(aggregated_parameters).tensors,
-            tensor_type=fl.common.ndarrays_to_parameters(aggregated_parameters).tensor_type
-        ), {}
-
-    def aggregate_parameters_weighted(self, parameters_and_weights):
-        """按权重聚合参数"""
-        # 提取权重和参数
-        parameters = [p[0] for p in parameters_and_weights]
-        weights = [p[1] for p in parameters_and_weights]
+            # Track weight evolution
+            parameters_list = fl.common.parameters_to_ndarrays(parameters_aggregated)
+            if len(parameters_list) > 0:
+                mean_weight = np.mean(parameters_list[0])
+                weights_over_time.append(mean_weight)
+            
+            # Fill in missing contribution data for visualization
+            for cid in client_contributions:
+                while len(client_contributions[cid]) < server_round:
+                    client_contributions[cid].append(0.0)
         
-        # 确保权重和为1
-        weights = np.array(weights) / np.sum(weights) if np.sum(weights) > 0 else np.array(weights)
-        
-        # 初始化存储聚合参数的数组
-        aggregated_parameters = [
-            np.zeros_like(param) for param in parameters[0]
+        return parameters_aggregated, {}
+    
+    def _aggregate_fit_params(self, results):
+        """Aggregate parameters from clients using weighted average"""
+        # Build parameters array from results
+        weights_results = [
+            (fl.common.parameters_to_ndarrays(fit_res.parameters), weight)
+            for _, fit_res, weight in results
         ]
         
-        # 按权重聚合参数
-        for param_set, weight in zip(parameters, weights):
-            for i, param in enumerate(param_set):
-                aggregated_parameters[i] += param * weight
+        # Perform weighted aggregation
+        parameters_aggregated = fl.common.aggregate.weighted_average(weights_results)
         
-        return aggregated_parameters
+        return fl.common.ndarrays_to_parameters(parameters_aggregated)
 
-# 启动服务器
-if __name__ == "__main__":
-    strategy = CustomFedAvg(
-        fraction_fit=1.0,  # 100% 客户端参与
-        min_fit_clients=2,  # **至少 1 个客户端**
-        min_available_clients=2,  # **至少 3 个客户端连接**
-    )
-
-    print("🚀 服务器启动，等待 3 个客户端连接...")
+def create_visualizations():
+    """Generate and save visualization plots"""
+    print("Creating visualizations...")
     
-    fl.server.start_server(
-        server_address="0.0.0.0:8080",  # 监听所有 IP
-        config=fl.server.ServerConfig(num_rounds=5),
-        strategy=strategy
-    )
-
-    # ========================== #
-    # 训练完成后可视化并保存图片  #
-    # ========================== #
-
-    # 📌 1. 绘制全局模型的损失曲线
-    plt.figure(figsize=(6, 4))
-    plt.plot(global_loss, label="Loss", color="blue")
-    plt.xlabel("Rounds")
-    plt.ylabel("Loss")
+    # 1. Global model loss over rounds
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(global_loss) + 1), global_loss, marker='o')
     plt.title("Global Model Loss over Rounds")
-    plt.legend()
-    plt.savefig("results/loss.png")
+    plt.xlabel("Round")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.savefig("results/global_loss.png")
     plt.close()
     
-    # 📌 2. 绘制全局模型的准确率曲线
-    plt.figure(figsize=(6, 4))
-    plt.plot(global_acc, label="Accuracy", color="green")
-    plt.xlabel("Rounds")
-    plt.ylabel("Accuracy")
+    # 2. Global model accuracy over rounds
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(global_acc) + 1), global_acc, marker='o')
     plt.title("Global Model Accuracy over Rounds")
-    plt.legend()
-    plt.savefig("results/accuracy.png")
+    plt.xlabel("Round")
+    plt.ylabel("Accuracy")
+    plt.grid(True)
+    plt.savefig("results/global_accuracy.png")
     plt.close()
-
-    # 📌 3. 修复 weights_over_time 记录后，绘制参数变化曲线
-    plt.figure(figsize=(6, 4))
-    plt.plot(weights_over_time, label="Mean Weights", color="red")
-    plt.xlabel("Rounds")
-    plt.ylabel("Mean Weight Value")
+    
+    # 3. Weight evolution
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(weights_over_time) + 1), weights_over_time, marker='o')
     plt.title("Weight Evolution in Federated Learning")
-    plt.legend()
-    plt.savefig("results/weights.png")
+    plt.xlabel("Round")
+    plt.ylabel("Mean Weight Value")
+    plt.grid(True)
+    plt.savefig("results/weight_evolution.png")
     plt.close()
-
-    # 📌 4. 绘制不同客户端的贡献曲线
-    plt.figure(figsize=(6, 4))
-    for client_id, updates in client_contributions.items():
-        plt.plot(updates, label=f"Client {client_id[:4]}")
-    plt.xlabel("Rounds")
-    plt.ylabel("Update Norm")
-    plt.title("Client Contribution Over Rounds")
+    
+    # 4. Client contributions
+    plt.figure(figsize=(12, 7))
+    for client_id, contributions in client_contributions.items():
+        rounds = range(1, len(contributions) + 1)
+        plt.plot(rounds, contributions, marker='o', label=f"Client {client_id[:6]}")
+        
+        # Mark failures with red X
+        failed_rounds = [i+1 for i, c in enumerate(contributions) if c == 0]
+        if failed_rounds:
+            plt.scatter(failed_rounds, [0] * len(failed_rounds), marker='x', color='red', s=100)
+    
+    plt.title("Client Contributions Over Rounds")
+    plt.xlabel("Round")
+    plt.ylabel("Contribution (Parameter Norm)")
+    plt.grid(True)
     plt.legend()
-    plt.savefig("results/client_contribution.png")
+    plt.savefig("results/client_contributions.png")
     plt.close()
+    
+    print("✅ Visualizations saved to 'results' directory")
 
-    print("✅ 训练完成，所有可视化结果已保存！")
+def main():
+    """Start the federated learning server"""
+    # Initialize custom strategy
+    strategy = FedAvgWithFailures(
+        fraction_fit=1.0,  # Use all available clients
+        min_fit_clients=args.min_clients,
+        min_available_clients=args.min_clients,
+        min_evaluate_clients=0,  # Skip evaluation for simplicity
+    )
+    
+    # Server configuration
+    server_config = fl.server.ServerConfig(num_rounds=args.rounds)
+    
+    print(f"🚀 Starting Federated Learning server on port {args.port}")
+    print(f"Running for {args.rounds} rounds with minimum {args.min_clients} clients")
+    
+    # Start server
+    fl.server.start_server(
+        server_address=f"0.0.0.0:{args.port}",
+        config=server_config,
+        strategy=strategy,
+    )
+    
+    # Create visualizations after training
+    create_visualizations()
+
+if __name__ == "__main__":
+    main()
