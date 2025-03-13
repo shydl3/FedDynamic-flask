@@ -30,19 +30,32 @@ os.makedirs("client_states", exist_ok=True)
 client_id = args.id if args.id else str(uuid.uuid4())[:8]
 state_file = f"client_states/client_{client_id}.json"
 
+# Default client state structure
+default_state = {
+    "id": client_id,
+    "rounds_participated": 0,
+    "last_active_round": 0,  # Changed from "last_round" to match usage
+    "is_failed": False,
+    "failed_rounds": []
+}
+
 # Load or initialize client state
 if os.path.exists(state_file):
-    with open(state_file, 'r') as f:
-        client_state = json.load(f)
-    print(f"Client {client_id}: Loaded existing state")
+    try:
+        with open(state_file, 'r') as f:
+            client_state = json.load(f)
+        print(f"Client {client_id}: Loaded existing state")
+        
+        # Ensure all required keys exist
+        for key, default_value in default_state.items():
+            if key not in client_state:
+                client_state[key] = default_value
+                print(f"Added missing key '{key}' to client state")
+    except:
+        client_state = default_state.copy()
+        print(f"Client {client_id}: Failed to load state file, created new state")
 else:
-    client_state = {
-        "id": client_id,
-        "rounds_participated": 0,
-        "last_round": 0,
-        "is_failed": False,
-        "failed_rounds": []
-    }
+    client_state = default_state.copy()
     with open(state_file, 'w') as f:
         json.dump(client_state, f)
     print(f"Client {client_id}: Initialized new state")
@@ -78,6 +91,7 @@ def train(model, train_loader, epochs=1):
     criterion = nn.CrossEntropyLoss()
     
     total_loss = 0.0
+    batch_count = 0
     for _ in range(epochs):
         for data, target in train_loader:
             data, target = data.to(device), target.to(device)
@@ -87,8 +101,9 @@ def train(model, train_loader, epochs=1):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            batch_count += 1
     
-    return total_loss / len(train_loader)
+    return total_loss / max(batch_count, 1)  # Avoid division by zero
 
 # Federated Learning Client
 class MNISTClient(fl.client.NumPyClient):
@@ -105,21 +120,21 @@ class MNISTClient(fl.client.NumPyClient):
         
         # Load existing weights if available
         if os.path.exists(self.weights_file):
-            self.model.load_state_dict(torch.load(self.weights_file))
-            print(f"Client {client_id}: Loaded existing weights")
+            try:
+                self.model.load_state_dict(torch.load(self.weights_file))
+                print(f"Client {client_id}: Loaded existing weights")
+            except Exception as e:
+                print(f"Error loading weights: {e}")
     
     def get_parameters(self, config):
         """Return model parameters as numpy array list"""
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        # Use detach() before numpy() to prevent the gradient error
+        return [param.cpu().detach().numpy() for param in self.model.parameters()]
     
     def set_parameters(self, parameters):
         """Set model parameters from numpy array list"""
-        state_dict = {}
-        idx = 0
-        for key in self.model.state_dict().keys():
-            state_dict[key] = torch.tensor(parameters[idx], device=device)
-            idx += 1
-        self.model.load_state_dict(state_dict, strict=True)
+        for param, new_param in zip(self.model.parameters(), parameters):
+            param.data = torch.tensor(new_param).to(device)
     
     def fit(self, parameters, config):
         """Train the model on local dataset"""
@@ -158,10 +173,10 @@ class MNISTClient(fl.client.NumPyClient):
                     json.dump(client_state, f)
                 return None, 0, {}
         
-        # Calculate missed rounds
+        # Calculate missed rounds - FIXED: Use last_active_round consistently
         missed_rounds = 0
-        if client_state["last_round"] > 0:
-            missed_rounds = current_round - client_state["last_round"] - 1
+        if client_state["last_active_round"] > 0:
+            missed_rounds = current_round - client_state["last_active_round"] - 1
         
         # Decide whether to reset weights
         if missed_rounds > 0:
@@ -183,7 +198,7 @@ class MNISTClient(fl.client.NumPyClient):
         
         # Update client state
         client_state["rounds_participated"] += 1
-        client_state["last_round"] = current_round
+        client_state["last_active_round"] = current_round
         
         # Save state and weights
         with open(state_file, 'w') as f:
@@ -193,8 +208,7 @@ class MNISTClient(fl.client.NumPyClient):
         print(f"📊 Client {self.client_id} completed round {current_round}, Loss: {loss:.4f}")
         
         # Return updated parameters, dataset size, and metrics
-        updated_params = [val.cpu().numpy() for _, val in self.model.state_dict().items()]
-        return updated_params, len(self.dataset), {"loss": loss}
+        return self.get_parameters({}), len(self.dataset), {"loss": loss}
     
     def evaluate(self, parameters, config):
         """Evaluate the model on local dataset"""
@@ -215,12 +229,11 @@ class MNISTClient(fl.client.NumPyClient):
                 total += target.size(0)
                 correct += (predicted == target).sum().item()
         
-        accuracy = correct / total
-        avg_loss = loss / len(self.train_loader)
+        accuracy = correct / total if total > 0 else 0
+        avg_loss = loss / len(self.train_loader) if len(self.train_loader) > 0 else 0
         
         return float(avg_loss), len(self.dataset), {"accuracy": accuracy}
 
-# Main function
 def main():
     # Create client instance
     client = MNISTClient(

@@ -37,6 +37,7 @@ def evaluate_global_model(parameters):
     model = Net().to(device)
     
     # Load parameters into model
+    state_dict = {}
     params_dict = zip(model.state_dict().keys(), parameters)
     state_dict = {k: torch.tensor(v) for k, v in params_dict}
     model.load_state_dict(state_dict, strict=True)
@@ -146,7 +147,8 @@ class FedAvgWithFailures(fl.server.strategy.FedAvg):
         
         if parameters_aggregated is not None:
             # Evaluate global model
-            loss, acc = evaluate_global_model(fl.common.parameters_to_ndarrays(parameters_aggregated))
+            parameters_list = fl.common.parameters_to_ndarrays(parameters_aggregated)
+            loss, acc = evaluate_global_model(parameters_list)
             print(f"📊 Round {server_round} - Global model evaluation: Loss={loss:.4f}, Accuracy={acc:.4f}")
             
             # Record metrics for visualization
@@ -154,7 +156,6 @@ class FedAvgWithFailures(fl.server.strategy.FedAvg):
             global_acc.append(acc)
             
             # Track weight evolution
-            parameters_list = fl.common.parameters_to_ndarrays(parameters_aggregated)
             if len(parameters_list) > 0:
                 mean_weight = np.mean(parameters_list[0])
                 weights_over_time.append(mean_weight)
@@ -167,17 +168,15 @@ class FedAvgWithFailures(fl.server.strategy.FedAvg):
         return parameters_aggregated, {}
     
     def _aggregate_fit_params(self, results):
-        """Aggregate parameters from clients using weighted average"""
-        # Build parameters array from results
+        """Aggregate parameters using weighted average"""
         weights_results = [
             (fl.common.parameters_to_ndarrays(fit_res.parameters), weight)
             for _, fit_res, weight in results
         ]
         
-        # Perform weighted aggregation
-        parameters_aggregated = fl.common.aggregate.weighted_average(weights_results)
-        
-        return fl.common.ndarrays_to_parameters(parameters_aggregated)
+        return fl.common.ndarrays_to_parameters(
+            fl.common.aggregate.weighted_average(weights_results)
+        )
 
 def create_visualizations():
     """Generate and save visualization plots"""
@@ -236,12 +235,17 @@ def create_visualizations():
 
 def main():
     """Start the federated learning server"""
-    # Initialize custom strategy
+    # Create a local model to provide initial parameters
+    initial_model = Net()
+    initial_parameters = [param.cpu().detach().numpy() for param in initial_model.parameters()]
+    
+    # Initialize custom strategy with initial parameters
     strategy = FedAvgWithFailures(
         fraction_fit=1.0,  # Use all available clients
         min_fit_clients=args.min_clients,
         min_available_clients=args.min_clients,
         min_evaluate_clients=0,  # Skip evaluation for simplicity
+        initial_parameters=fl.common.ndarrays_to_parameters(initial_parameters),  # Add initial parameters
     )
     
     # Server configuration
