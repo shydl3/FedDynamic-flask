@@ -15,10 +15,18 @@ parser.add_argument("--fail_probs", type=str, default="0.2,0.1,0.3",
                    help="Comma-separated failure probabilities")
 parser.add_argument("--recovery_probs", type=str, default="0.7,0.8,0.6",
                    help="Comma-separated recovery probabilities")
+parser.add_argument("--flwr_slient", action="store_true", help="Run Flower in silent mode")
 args = parser.parse_args()
 
 # Create results directory
 os.makedirs("results", exist_ok=True)
+
+if args.flwr_slient:
+    os.environ["FLWR_LOG_LEVEL"] = "ERROR"
+    os.environ["FLWR_LOG_LEVEL"] = "ERROR"
+else:
+    os.environ["FLWR_LOG_LEVEL"] = "INFO"
+    os.environ["FLWR_LOG_LEVEL"] = "INFO"
 
 # Parse client parameters
 dataset_sizes = [int(x) for x in args.dataset_sizes.split(",")]

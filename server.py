@@ -357,6 +357,9 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         expected_clients = global_metrics["expected_clients"].copy()
         missing_clients = expected_clients - successful_clients - failed_clients
         
+        # Log all client statuses for this round
+        logger.info(f"Round {server_round}: {len(successful_clients)} successful, {len(failed_clients)} failed, {len(missing_clients)} missing")
+        
         for client_id in missing_clients:
             if client_id in global_metrics["client_status"]:
                 # Update status
@@ -364,13 +367,13 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
                 status["active"] = False
                 status["missed_rounds"] += 1
                 
-                # Add missed record
+                # Add missed record - MARK AS FAILURE not missed!
                 if client_id not in self.client_history:
                     self.client_history[client_id] = {"participation_records": []}
                 
                 self.client_history[client_id]["participation_records"].append({
                     "round": server_round,
-                    "status": "missed"
+                    "status": "failure"  # Changed from "missed" to "failure"
                 })
                 
                 # Calculate reliability
@@ -378,65 +381,61 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
                 
                 # Update visualization data
                 self._update_reliability_data(
-                    client_id, server_round, "missed", 
+                    client_id, server_round, "failure", 
                     reliability_score, False
                 )
     
     def _update_reliability_data(self, client_id, round_num, status, reliability, data_recovered=False):
         """Update client reliability tracking data for visualization"""
+        # Find all entries for this client and round
         entries = [e for e in global_metrics["client_reliability"][client_id] 
-                  if e["round"] == round_num]
+                if e["round"] == round_num]
         
-        if entries and entries[0]["status"] == "pending":
-            # Update existing entry
-            entries[0]["status"] = status
-            entries[0]["reliability"] = reliability
-            if status == "failure":
-                entries[0]["data_recovered"] = data_recovered
-        else:
-            # Create new entry
-            global_metrics["client_reliability"][client_id].append({
-                "round": round_num,
-                "reliability": reliability,
-                "status": status,
-                "data_recovered": data_recovered if status == "failure" else False
-            })
+        # Always create a new entry instead of conditionally updating
+        # This ensures we record the latest status for each round
+        global_metrics["client_reliability"][client_id].append({
+            "round": round_num,
+            "reliability": reliability,
+            "status": status,
+            "data_recovered": data_recovered if status == "failure" else False
+        })
+        
+        # Log the status change for debugging
+        logger.info(f"Client {client_id[:8]} in round {round_num}: status={status}, reliability={reliability:.2f}")
     
     def _fill_missing_rounds(self, current_round):
-        """Fill in missing round entries for visualization continuity"""
-        for client_id in global_metrics["expected_clients"]:
-            # Ensure client has reliability data
-            if client_id not in global_metrics["client_reliability"]:
-                global_metrics["client_reliability"][client_id] = []
+        """Fill in missing rounds for visualization continuity"""
+        for client_id, status_info in global_metrics["client_status"].items():
+            reliability_data = global_metrics["client_reliability"].get(client_id, [])
             
-            reliability_data = global_metrics["client_reliability"][client_id]
-            rounds_present = {entry["round"] for entry in reliability_data}
+            # Find rounds where we have data
+            rounds_with_data = {entry["round"] for entry in reliability_data}
             
-            # Ensure round 1 entry exists
-            if 1 not in rounds_present:
-                global_metrics["client_reliability"][client_id].append({
-                    "round": 1,
-                    "reliability": 0.5,
-                    "status": "missed",
-                    "data_recovered": False
-                })
-            
-            # Fill other missing rounds
-            for r in range(2, current_round + 1):
-                if r not in rounds_present:
-                    # Find previous round's reliability
+            # For each round from 1 to current
+            for r in range(1, current_round + 1):
+                if r not in rounds_with_data:
+                    # If client is inactive and round is after their last active round
+                    last_active = status_info.get("last_active_round", 0)
+                    
+                    # Get previous entries to determine status
                     prev_entries = [e for e in reliability_data if e["round"] < r]
+                    prev_status = "missed"
                     prev_reliability = 0.5
                     
                     if prev_entries:
-                        prev_entry = max(prev_entries, key=lambda e: e["round"])
-                        prev_reliability = prev_entry["reliability"]
+                        # Get the most recent entry
+                        latest_entry = max(prev_entries, key=lambda e: e["round"])
+                        prev_reliability = latest_entry.get("reliability", 0.5)
+                        
+                        # If previous status was failure, continue marking as failure
+                        if latest_entry.get("status") == "failure":
+                            prev_status = "failure"
                     
-                    # Add entry with slightly degraded reliability
+                    # Add missing round entry with appropriate status
                     global_metrics["client_reliability"][client_id].append({
                         "round": r,
                         "reliability": max(0.1, prev_reliability - 0.05),
-                        "status": "missed",
+                        "status": prev_status,
                         "data_recovered": False
                     })
     
@@ -553,37 +552,40 @@ def plot_client_reliability():
     # Determine max round
     max_rounds = global_metrics["rounds"]
     
-    # Plot lines for each client
+    # Get the final status for each client for each round
+    client_final_statuses = {}
+    for client_id, reliability_data in global_metrics["client_reliability"].items():
+        client_final_statuses[client_id] = {}
+        for entry in reliability_data:
+            round_num = entry.get("round")
+            client_final_statuses[client_id][round_num] = entry
+    
+    # First pass: Plot lines for each client
     for client_id, reliability_data in global_metrics["client_reliability"].items():
         if not reliability_data:
             continue
         
         # Sort data and create continuous plotting data
-        reliability_data.sort(key=lambda x: x["round"])
-        rounds_data = {entry["round"]: entry["reliability"] for entry in reliability_data}
+        rounds_to_plot = sorted(set(entry["round"] for entry in reliability_data))
+        reliability_to_plot = []
         
-        continuous_rounds = list(range(1, max_rounds + 1))
-        continuous_reliability = []
-        
-        for r in continuous_rounds:
-            if r in rounds_data:
-                continuous_reliability.append(rounds_data[r])
-            else:
-                # Find previous value or use default
-                prev_values = [rounds_data[prev_r] for prev_r in rounds_data if prev_r < r]
-                reliability = 0.5 if not prev_values else prev_values[-1] * 0.95
-                continuous_reliability.append(reliability)
+        # Use the final status for each round
+        for round_num in rounds_to_plot:
+            final_entries = [e for e in reliability_data if e["round"] == round_num]
+            if final_entries:
+                final_entry = final_entries[-1]  # Use the last entry for this round
+                reliability_to_plot.append(final_entry["reliability"])
         
         # Plot line connecting all points
-        plt.plot(continuous_rounds, continuous_reliability, '-', 
+        plt.plot(rounds_to_plot, reliability_to_plot, '-', 
                 color=client_colors[client_id], label=f"Client {client_id[:8]}", 
                 alpha=0.7, linewidth=1.5)
     
-    # Add markers for each data point
-    for client_id, reliability_data in global_metrics["client_reliability"].items():
+    # Second pass: Add markers for final status of each round
+    for client_id, final_statuses in client_final_statuses.items():
         client_color = client_colors[client_id]
         
-        for entry in reliability_data:
+        for round_num, entry in final_statuses.items():
             # Skip pending entries
             if entry.get("status", "") == "pending":
                 continue
@@ -616,7 +618,7 @@ def plot_client_reliability():
             
             # Add point with styling
             plt.scatter(
-                entry["round"], 
+                round_num, 
                 entry["reliability"],
                 marker=marker,
                 s=size,
@@ -662,15 +664,16 @@ def print_client_summary():
     """Print summary of client participation"""
     print("\nClient participation summary:")
     for client_id, data in global_metrics["client_reliability"].items():
-        # Sort data by round, then by time added (assuming later entries in the list are more recent)
+        # Create dictionary to track most recent status for each round
         data_by_round = {}
         
-        # Process entries in reverse order (most recent first) to ensure we get the last status for each round
-        for entry in reversed(sorted(data, key=lambda e: e.get("round", 0))):
+        # Process entries in order of addition (last entry for a round will overwrite previous ones)
+        # This ensures we get the final status for each round
+        for entry in data:
             if entry.get("status") != "pending":
                 round_num = entry.get("round", 0)
-                if round_num not in data_by_round:
-                    data_by_round[round_num] = entry.get("status", "unknown")
+                # Always update with latest status (overwriting any previous entry)
+                data_by_round[round_num] = entry.get("status", "unknown")
         
         rounds = sorted(data_by_round.keys())
         statuses = {r: data_by_round[r] for r in rounds}
