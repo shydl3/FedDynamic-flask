@@ -249,9 +249,9 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         
         return reliability_score, keep_weights
 
-# Function to create visualizations
 def create_visualizations():
-    print(f"Creating visualizations with {len(global_metrics['loss'])} loss points, {len(global_metrics['accuracy'])} accuracy points")
+    """Create visualizations for federated learning metrics"""
+    print(f"Creating visualizations with {len(global_metrics['loss'])} loss points")
     
     # 1. Plot global loss
     plt.figure(figsize=(10, 6))
@@ -292,19 +292,27 @@ def create_visualizations():
     plt.savefig("results/weights_evolution.png")
     plt.close()
     
-    # 4. Plot client reliability (replacing client contributions)
+    # 4. Plot client reliability with consistent colors and meaningful markers
     plt.figure(figsize=(12, 7))
     
-    # Define markers
-    success_marker = 'o'  # Circle for normal operation
-    failure_marker = 'x'  # X for failure
-    recovery_marker = '+'  # Plus for recovered data
+    # Define markers for different states
+    success_marker = 'o'       # Circle: Normal success
+    failure_marker = 'x'       # X: Failure
+    keep_weights_marker = '^'  # Triangle up: Recovered with original weights
+    new_weights_marker = 'v'   # Triangle down: Recovered with new weights
+    
+    # Create consistent colors for each client
+    client_ids = list(global_metrics["client_reliability"].keys())
+    colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(client_ids))))
+    client_colors = {cid: colors[i % len(colors)] for i, cid in enumerate(client_ids)}
     
     # Track all rounds for x-axis
     all_rounds = set()
     
-    # Plot each client's reliability
-    for client_id, reliability_data in global_metrics["client_reliability"].items():
+    # First pass: plot lines for each client
+    for client_id in client_ids:
+        reliability_data = global_metrics["client_reliability"][client_id]
+        
         # Sort data by round
         reliability_data.sort(key=lambda x: x["round"])
         
@@ -315,47 +323,80 @@ def create_visualizations():
         # Update all rounds
         all_rounds.update(rounds)
         
-        # Plot the reliability line
-        plt.plot(rounds, reliability_scores, '-', label=f"Client {client_id[:8]}")
+        # Plot the reliability line with client's consistent color
+        plt.plot(rounds, reliability_scores, '-', color=client_colors[client_id], 
+                label=f"Client {client_id[:8]}", linewidth=1.5)
+    
+    # Second pass: add markers for each data point
+    for client_id in client_ids:
+        reliability_data = global_metrics["client_reliability"][client_id]
+        client_color = client_colors[client_id]
         
-        # Plot points with appropriate markers
         for entry in reliability_data:
-            if entry["status"] == "failure":
-                if entry["data_recovered"]:
-                    # Failure with data recovery
-                    plt.scatter(entry["round"], entry["reliability"], 
-                              marker=recovery_marker, s=100, color='green', zorder=5)
+            marker = success_marker  # Default
+            size = 80
+            edge_color = 'black'
+            zorder = 3
+            
+            if entry.get("status") == "failure":
+                marker = failure_marker
+                size = 100
+                edge_color = 'red'
+                zorder = 5
+            elif entry.get("status") == "rejoin":
+                # Rejoining client
+                if entry.get("keep_weights", False):
+                    marker = keep_weights_marker  # Kept weights
+                    edge_color = 'green'
                 else:
-                    # Failure without data recovery
-                    plt.scatter(entry["round"], entry["reliability"], 
-                              marker=failure_marker, s=100, color='red', zorder=5)
-            else:
-                # Normal operation
-                plt.scatter(entry["round"], entry["reliability"], 
-                          marker=success_marker, s=80, zorder=3)
+                    marker = new_weights_marker  # Got new weights
+                    edge_color = 'blue'
+                size = 120
+                zorder = 4
+            
+            plt.scatter(
+                entry["round"], 
+                entry["reliability"], 
+                marker=marker, 
+                s=size, 
+                color=client_color,
+                edgecolors=edge_color,
+                linewidth=1.5,
+                zorder=zorder
+            )
     
-    # Customize plot appearance
-    plt.title("Client Reliability Scores Over Rounds")
-    plt.xlabel("Round")
-    plt.ylabel("Reliability Score")
-    plt.ylim(0, 1.1)  # Reliability scores are between 0 and 1
-    plt.grid(True)
+    # Customize plot
+    plt.title("Client Reliability Scores Over Rounds", fontsize=14)
+    plt.xlabel("Round", fontsize=12)
+    plt.ylabel("Reliability Score", fontsize=12)
+    plt.ylim(0, 1.1)
+    plt.grid(True, alpha=0.3)
     
-    # Create legend for client lines
-    handles, labels = plt.gca().get_legend_handles_labels()
+    # Create legend for clients
+    from matplotlib.lines import Line2D
+    client_legend = plt.legend(loc='upper left')
+    plt.gca().add_artist(client_legend)
     
     # Create legend for markers
-    success_patch = mpatches.Patch(color='blue', label='Success (o)')
-    failure_patch = mpatches.Patch(color='red', label='Failure (x)')
-    recovery_patch = mpatches.Patch(color='green', label='Data Recovered (+)')
+    marker_elements = [
+        Line2D([0], [0], marker=success_marker, color='gray', markerfacecolor='gray', 
+              markeredgecolor='black', markersize=8, label='Success'),
+        Line2D([0], [0], marker=failure_marker, color='gray', markerfacecolor='gray', 
+              markeredgecolor='red', markersize=8, label='Failure'),
+        Line2D([0], [0], marker=keep_weights_marker, color='gray', markerfacecolor='gray', 
+              markeredgecolor='green', markersize=8, label='Recover w/ Weights'),
+        Line2D([0], [0], marker=new_weights_marker, color='gray', markerfacecolor='gray', 
+              markeredgecolor='blue', markersize=8, label='Recover w/ New Weights')
+    ]
     
-    # Add both sets of legend items
-    all_handles = handles + [success_patch, failure_patch, recovery_patch]
-    all_labels = labels + ['Success', 'Failure', 'Data Recovered']
-    plt.legend(all_handles, all_labels, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3)
+    plt.legend(handles=marker_elements, loc='upper right')
+    
+    # Set x-axis to show only integer round numbers
+    if all_rounds:
+        plt.xticks(sorted(list(all_rounds)))
     
     plt.tight_layout()
-    plt.savefig("results/client_reliability.png", bbox_inches='tight')
+    plt.savefig("results/client_reliability.png", bbox_inches='tight', dpi=300)
     plt.close()
     
     print("✅ All visualizations saved to 'results' directory")
