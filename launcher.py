@@ -13,7 +13,7 @@ parser.add_argument("--dataset_sizes", type=str, default="10000,20000,30000",
                    help="Comma-separated dataset sizes for each client")
 parser.add_argument("--fail_probs", type=str, default="0.2,0.1,0.3",
                    help="Comma-separated failure probabilities")
-parser.add_argument("--recovery_probs", type=str, default="0.7,0.8,0.6",
+parser.add_argument("--recovery_probs", type=str, default="0.5,0.3,0.9",
                    help="Comma-separated recovery probabilities")
 parser.add_argument("--flwr_silent", action="store_true", help="Run Flower in silent mode")
 args = parser.parse_args()

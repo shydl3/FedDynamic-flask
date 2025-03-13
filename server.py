@@ -340,69 +340,91 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
                     })
     
     def calculate_client_reliability_score(self, client_id, current_round):
-        """Calculate client reliability score using exponential time decay"""
+        """Calculate client reliability score using exponential time decay with improved factors"""
+        # Get client history
         history = self.client_history.get(client_id, {"participation_records": []})
         participation_records = history.get("participation_records", [])
         
         if not participation_records:
-            return 0.5, False  # Default for new clients
+            return 0.5, False  # Default moderate reliability for new clients
         
         # Constants
-        decay_rate = 0.2
-        max_history = 20
+        decay_rate = 0.15      # Slightly reduced decay rate for smoother transitions
+        max_history = 20       # Consider at most 20 recent records
+        base_success_impact = 0.5    # Base positive impact for successful participation 
+        failure_impact = -1.0        # Strong negative impact for failures
+        missed_impact = -0.5         # Moderate negative impact for missed rounds
+        dataset_factor = 0.3         # Weight factor for dataset size
+        reliability_threshold = 0.6  # Constant threshold for weight keeping
         
         # Calculate weighted score
         reliability_score = 0.0
         normalization_factor = 0.0
+        consecutive_failures = 0
         
-        for record in sorted(participation_records[-max_history:], key=lambda x: x["round"]):
-            # Time decay - more recent records have more weight
+        # Sort records by round to process them in chronological order
+        sorted_records = sorted(participation_records[-max_history:], key=lambda x: x["round"])
+        
+        for record in sorted_records:
+            # Apply exponential time decay - more recent records count more
             time_diff = current_round - record["round"]
             time_weight = math.exp(-decay_rate * time_diff)
             
-            # Calculate impact based on record type
+            # Calculate impact based on record type and properties
             if record["status"] == "success":
-                # Positive impact for success
-                impact = 0.3 * (1.0 + min(1.0, record.get("num_examples", 100) / 1000))
+                # For successful participation:
+                # 1. Base positive impact
+                # 2. Bonus based on dataset size (num_examples)
+                dataset_size = record.get("num_examples", 100)  # Default if not specified
+                dataset_bonus = min(1.0, dataset_size / 5000) * dataset_factor
+                impact = base_success_impact + dataset_bonus
+                consecutive_failures = 0  # Reset consecutive failures
             elif record["status"] == "failure":
-                # Negative impact for failure
-                impact = -0.8
-            else:
-                impact = -0.3
+                # For failures:
+                # 1. Negative impact
+                # 2. Additional penalty for consecutive failures
+                consecutive_failures += 1
+                consecutive_penalty = min(0.5, consecutive_failures * 0.1)  # Up to 0.5 extra penalty
+                impact = failure_impact - consecutive_penalty
+            else:  # missed or unknown
+                impact = missed_impact
             
+            # Add weighted impact to score
             reliability_score += impact * time_weight
             normalization_factor += time_weight
         
         # Normalize to 0-1 range
         if normalization_factor > 0:
-            reliability_score = 0.5 + (reliability_score / (2.0 * normalization_factor))
-            reliability_score = max(0.1, min(0.95, reliability_score))
+            # Center around 0.5, scale based on weighted impacts
+            reliability_score = 0.5 + (reliability_score / (3.0 * normalization_factor))
+            # Clamp to reasonable range, avoiding extreme values
+            reliability_score = max(0.05, min(0.95, reliability_score))
         else:
+            # Default value if no records to process
             reliability_score = 0.5
         
-        # Determine whether to keep weights based on reliability and time away
+        # Check if client has been absent too long
         last_seen = max([r["round"] for r in participation_records]) if participation_records else 0
         rounds_missed = current_round - last_seen
-        threshold = 0.6 * math.exp(-0.05 * rounds_missed)
-        keep_weights = reliability_score >= threshold
+        
+        # Log useful information
+        if self.verbose and random.random() < 0.2:  # Only log occasionally to reduce noise
+            logger.info(f"Client {client_id[:8]}: reliability={reliability_score:.3f}, missed={rounds_missed} rounds")
+        
+        # Use constant threshold as requested, but reduce reliability if client missed too many rounds
+        if rounds_missed > 3:
+            # Apply penalty for extended absence
+            reliability_score = max(0.05, reliability_score - (rounds_missed - 3) * 0.05)
+        
+        # Determine whether to keep weights based on constant threshold
+        keep_weights = reliability_score >= reliability_threshold
         
         return reliability_score, keep_weights
 
 def print_client_summary():
     """Print summary of client participation"""
     print("\nClient participation summary:")
-    for client_id, data in global_metrics["client_reliability"].items():
-        # Get latest status for each round
-        data_by_round = {}
-        for entry in data:
-            round_num = entry.get("round", 0)
-            if entry.get("status") != "pending":
-                # Always use the most recent status for each round
-                data_by_round[round_num] = entry.get("status", "unknown")
-        
-        rounds = sorted(data_by_round.keys())
-        statuses = {r: data_by_round[r] for r in rounds}
-        print(f"Client {client_id[:8]}: Rounds {rounds} with statuses: {statuses}")
+    print(global_metrics["client_reliability"])
 
 def plot_client_reliability():
     """Create client reliability visualization"""
@@ -421,18 +443,27 @@ def plot_client_reliability():
     
     max_rounds = global_metrics["rounds"]
     
-    # For each client, get the most recent entry for each round
+    # For each client, get entries for each round, prioritizing 'rejoin' status over other statuses
     client_round_data = {}
     for client_id, reliability_data in global_metrics["client_reliability"].items():
         round_to_entry = {}
+        
+        # First pass: Add all entries
         for entry in reliability_data:
             round_num = entry["round"]
-            # Always keep the latest entry for each round
-            round_to_entry[round_num] = entry
+            status = entry.get("status", "")
             
-            # Debug print for rejoin entries
-            if entry.get("status") == "rejoin":
+            # If we don't have an entry for this round yet, add it
+            if round_num not in round_to_entry:
+                round_to_entry[round_num] = entry
+            # If this is a rejoin entry, it takes precedence
+            elif status == "rejoin":
+                round_to_entry[round_num] = entry
                 print(f"Found REJOIN entry: Client {client_id[:8]}, Round {round_num}, Keep weights: {entry.get('keep_weights', False)}")
+            # Otherwise, only update if the existing entry is not a rejoin entry
+            elif round_to_entry[round_num].get("status") != "rejoin":
+                round_to_entry[round_num] = entry
+        
         client_round_data[client_id] = round_to_entry
     
     # First pass: Plot lines for each client
@@ -455,34 +486,28 @@ def plot_client_reliability():
             # Determine marker and styling
             marker = success_marker
             size = 80
-            edge_color = 'black'
             line_width = 1.5
             
             if status == "failure":
                 marker = failure_marker
                 size = 100
-                edge_color = 'red'
-                line_width = 2
             elif status == "rejoin":
                 # Explicitly handle rejoin status
                 if entry.get("keep_weights", False):
                     marker = keep_weights_marker
-                    edge_color = 'green'
                 else:
                     marker = new_weights_marker
-                    edge_color = 'blue'
                 size = 120
-                line_width = 2
+                
                 print(f"Plotting REJOIN marker at ({round_num}, {entry['reliability']})")
             
-            # Add marker
+            # Add marker - using client_color for both face and edge for consistency
             plt.scatter(
                 round_num,
                 entry["reliability"],
                 marker=marker,
                 s=size,
-                color=client_color,
-                edgecolors=edge_color,
+                color=client_color,  # Single color for both marker and edge
                 linewidth=line_width,
                 zorder=5 if status != "success" else 3
             )
