@@ -9,6 +9,12 @@ from collections import defaultdict
 from model import Net
 import math
 import matplotlib.patches as mpatches
+import logging
+import random
+from matplotlib.lines import Line2D
+
+# Configure logging to show only higher-level messages
+logging.getLogger().setLevel(logging.WARNING)
 
 # Create results directory
 os.makedirs("results", exist_ok=True)
@@ -21,7 +27,8 @@ global_metrics = {
     "weights_evolution": [],
     "client_reliability": defaultdict(list),  # Changed from contributions to reliability
     "client_status": {},
-    "client_dataset_size": {}
+    "client_dataset_size": {},
+    "expected_clients": set()  # Track which clients should be participating
 }
 
 # Function to evaluate global model
@@ -67,9 +74,40 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         self.client_history = {}  # Dictionary to track client participation
         self.current_round = 0
         self.verbose = True  # For logging reliability calculations
+        self.all_clients_initialized = False
+    
+    def initialize_clients(self, client_manager):
+        """Initialize all available clients at the beginning"""
+        available_clients = client_manager.all()
+        global_metrics["expected_clients"] = set([client.cid for client in available_clients])
+        
+        print(f"Initial clients registered: {global_metrics['expected_clients']}")
+        
+        for client in available_clients:
+            client_id = client.cid
+            # Initialize client status
+            if client_id not in global_metrics["client_status"]:
+                global_metrics["client_status"][client_id] = {
+                    "active": True,
+                    "missed_rounds": 0,
+                    "last_active_round": 0
+                }
+                
+            # Initialize empty reliability history
+            if client_id not in global_metrics["client_reliability"]:
+                global_metrics["client_reliability"][client_id] = []
+        
+        self.all_clients_initialized = True
     
     def aggregate_fit(self, server_round, results, failures):
         global_metrics["rounds"] = server_round
+        
+        # Get successful and failed client IDs
+        successful_clients = {client_proxy.cid for client_proxy, _ in results}
+        failed_clients = {client_proxy.cid for client_proxy in failures}
+        
+        # Update all expected clients for this round
+        expected_clients = global_metrics["expected_clients"].copy()
         
         # Process results for global metrics
         if results:
@@ -109,6 +147,18 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
                 "contribution": contribution,
             })
             
+            # Update client status
+            if client_id not in global_metrics["client_status"]:
+                global_metrics["client_status"][client_id] = {
+                    "active": True,
+                    "missed_rounds": 0,
+                    "last_active_round": server_round
+                }
+            else:
+                global_metrics["client_status"][client_id]["active"] = True
+                global_metrics["client_status"][client_id]["missed_rounds"] = 0
+                global_metrics["client_status"][client_id]["last_active_round"] = server_round
+            
             # Calculate reliability score
             reliability_score, _ = self.calculate_client_reliability_score(client_id, server_round)
             
@@ -134,6 +184,17 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
                 "status": "failure"
             })
             
+            # Update client status
+            if client_id not in global_metrics["client_status"]:
+                global_metrics["client_status"][client_id] = {
+                    "active": False,
+                    "missed_rounds": 1,
+                    "last_active_round": 0
+                }
+            else:
+                global_metrics["client_status"][client_id]["active"] = False
+                global_metrics["client_status"][client_id]["missed_rounds"] += 1
+            
             # Calculate reliability score for the failed client
             reliability_score, _ = self.calculate_client_reliability_score(client_id, server_round)
             
@@ -148,6 +209,34 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
                 "data_recovered": data_recovered
             })
         
+        # Handle missing clients (neither successful nor failed)
+        missing_clients = expected_clients - successful_clients - failed_clients
+        for client_id in missing_clients:
+            if client_id in global_metrics["client_status"]:
+                status = global_metrics["client_status"][client_id]
+                status["active"] = False
+                status["missed_rounds"] += 1
+                
+                # Record as missed in history
+                if client_id not in self.client_history:
+                    self.client_history[client_id] = {"participation_records": []}
+                
+                self.client_history[client_id]["participation_records"].append({
+                    "round": server_round,
+                    "status": "missed"
+                })
+                
+                # Calculate reliability
+                reliability_score, _ = self.calculate_client_reliability_score(client_id, server_round)
+                
+                # Add to visualization data
+                global_metrics["client_reliability"][client_id].append({
+                    "round": server_round,
+                    "reliability": reliability_score,
+                    "status": "failure",  # Treat missed as failure
+                    "data_recovered": False
+                })
+        
         # Continue with original aggregation logic
         return super().aggregate_fit(server_round, results, failures)
     
@@ -155,35 +244,61 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         """Configure clients for training - handle rejoining clients"""
         self.current_round = server_round
         
+        # Initialize clients if first round
+        if not self.all_clients_initialized:
+            self.initialize_clients(client_manager)
+        
         # Get all clients and their configuration
         config = {}
         
-        # Get available client IDs
-        available_clients = client_manager.all()
+        # Get available client IDs for this round
+        available_clients = [client.cid for client in client_manager.all()]
+        
+        # Update expected clients set
+        global_metrics["expected_clients"].update(available_clients)
         
         # Check if any clients rejoined after failure
-        for client_id, status in global_metrics["client_status"].items():
-            # Initialize status if needed
-            if "active" not in status:
-                status["active"] = True
-            if "missed_rounds" not in status:
-                status["missed_rounds"] = 0
-            
-            if status["active"] == False and client_id in available_clients:
-                # Client is rejoining
-                reliability_score, keep_weights = self.calculate_client_reliability_score(
-                    client_id, server_round
-                )
+        for client_id in available_clients:
+            if client_id in global_metrics["client_status"]:
+                status = global_metrics["client_status"][client_id]
                 
-                if keep_weights:
-                    print(f"🔄 Client {client_id[:8]} rejoined - reliability: {reliability_score:.2f} - keeping weights")
-                    config[client_id] = {"keep_weights": True}
-                else:
-                    print(f"🆕 Client {client_id[:8]} rejoined - reliability: {reliability_score:.2f} - resetting weights")
-                    config[client_id] = {"keep_weights": False}
+                # Initialize status if needed
+                if "active" not in status:
+                    status["active"] = True
+                if "missed_rounds" not in status:
+                    status["missed_rounds"] = 0
                 
-                # Mark as active again
-                status["active"] = True
+                # Client is rejoining after failure
+                if status["active"] == False:
+                    # Client is rejoining
+                    reliability_score, keep_weights = self.calculate_client_reliability_score(
+                        client_id, server_round
+                    )
+                    
+                    if keep_weights:
+                        print(f"🔄 Client {client_id[:8]} rejoined - reliability: {reliability_score:.2f} - keeping weights")
+                        config[client_id] = {"keep_weights": True}
+                    else:
+                        print(f"🆕 Client {client_id[:8]} rejoined - reliability: {reliability_score:.2f} - resetting weights")
+                        config[client_id] = {"keep_weights": False}
+                    
+                    # Mark as active again
+                    status["active"] = True
+                    
+                    # Record rejoin event in reliability metrics
+                    global_metrics["client_reliability"][client_id].append({
+                        "round": server_round,
+                        "reliability": reliability_score,
+                        "status": "rejoin",
+                        "keep_weights": keep_weights
+                    })
+            else:
+                # New client
+                global_metrics["client_status"][client_id] = {
+                    "active": True,
+                    "missed_rounds": 0,
+                    "last_active_round": 0
+                }
         
         return super().configure_fit(server_round, parameters, client_manager)
     
@@ -236,7 +351,7 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
             reliability_score = 0.5
         
         # Debug output if needed
-        if self.verbose:
+        if self.verbose and random.random() < 0.2:  # Only log about 20% of the time to reduce noise
             print(f"Client {client_id[:8]}: reliability={reliability_score:.3f}")
         
         # Determine whether to keep weights
@@ -257,7 +372,7 @@ def create_visualizations():
     print("\nClient participation by round:")
     for client_id, data in global_metrics["client_reliability"].items():
         rounds = sorted(set(entry["round"] for entry in data))
-        statuses = {r: [entry["status"] for entry in data if entry["round"] == r] for r in rounds}
+        statuses = {r: [entry["status"] for entry in data if entry["round"] == r][0] for r in rounds}
         print(f"Client {client_id[:8]}: Rounds {rounds} with statuses: {statuses}")
     
     # Normal plots (loss, accuracy, weights) remain the same
@@ -314,6 +429,7 @@ def create_visualizations():
     client_colors = {cid: colors[i % len(colors)] for i, cid in enumerate(client_ids)}
     
     all_rounds = set()
+    max_rounds = global_metrics["rounds"]
     
     # First pass: Plot lines for each client
     for client_id, reliability_data in global_metrics["client_reliability"].items():
@@ -321,12 +437,32 @@ def create_visualizations():
             continue
             
         reliability_data.sort(key=lambda x: x["round"])
-        rounds = [entry["round"] for entry in reliability_data]
-        all_rounds.update(rounds)
-        reliability_scores = [entry["reliability"] for entry in reliability_data]
+        
+        # Create continuous rounds
+        continuous_rounds = list(range(1, max_rounds + 1))
+        continuous_reliability = []
+        
+        # Track last reliability score for gap filling
+        last_reliability = 0.5  # Default start
+        
+        # Fill in values for all rounds
+        for r in continuous_rounds:
+            entries = [entry for entry in reliability_data if entry["round"] == r]
+            if entries:
+                # Use the last entry for this round (in case of multiple entries)
+                entry = entries[-1]
+                last_reliability = entry["reliability"]
+                continuous_reliability.append(last_reliability)
+            else:
+                # Use previous reliability with a small penalty
+                last_reliability = max(0.1, last_reliability - 0.05)
+                continuous_reliability.append(last_reliability)
+        
+        # Update all rounds
+        all_rounds.update(continuous_rounds)
         
         # Plot line connecting all points for this client
-        plt.plot(rounds, reliability_scores, '-', color=client_colors[client_id], 
+        plt.plot(continuous_rounds, continuous_reliability, '-', color=client_colors[client_id], 
                 label=f"Client {client_id[:8]}", alpha=0.7, linewidth=1.5)
     
     # Second pass: Add markers with different shapes/colors for status
@@ -371,7 +507,6 @@ def create_visualizations():
             )
     
     # Add dummy scatter points to ensure all important states show in the legend
-    from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], marker=success_marker, color='w', markerfacecolor='gray', 
               markeredgecolor='black', markersize=10, label='Success'),
@@ -395,8 +530,7 @@ def create_visualizations():
     plt.grid(True, alpha=0.3)
     
     # Set x-axis to show integer rounds
-    if all_rounds:
-        plt.xticks(sorted(list(all_rounds)))
+    plt.xticks(range(1, max_rounds + 1))
     
     plt.tight_layout()
     plt.savefig("results/client_reliability.png", bbox_inches='tight', dpi=300)
