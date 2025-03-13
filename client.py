@@ -35,13 +35,14 @@ if args.client_id is None:
         with open(client_id_file, "w") as f:
             json.dump({"id": args.client_id}, f)
 
-print(f"Client {args.client_id[:8]} starting - Dataset: {args.dataset_size}, Fail prob: {args.fail_prob}")
+print(f"🛩️  Client {args.client_id[:8]} starting - Dataset: {args.dataset_size}, Fail prob: {args.fail_prob}")
 
 # Track client state
 client_state = {
     "active": True,
     "rounds_participated": 0,
-    "rounds_missed": 0
+    "rounds_missed": 0,
+    "rounds_total": 0
 }
 
 # Load MNIST dataset (subset based on dataset_size)
@@ -86,6 +87,8 @@ class MNISTClient(fl.client.NumPyClient):
             param.data = torch.from_numpy(parameters[i]).to(device)
     
     def fit(self, parameters, config):
+        client_state["rounds_total"] += 1
+        
         # Check if client should fail
         if random.random() < args.fail_prob and client_state["active"]:
             client_state["active"] = False
@@ -117,7 +120,7 @@ class MNISTClient(fl.client.NumPyClient):
         # Return updated parameters
         updated_params = self.get_parameters(config)
         
-        print(f"📊 Client {args.client_id[:8]} completed round {client_state['rounds_participated']}")
+        print(f"📊 Client {args.client_id[:8]} completed round {client_state['rounds_total']}")
         
         return updated_params, len(self.trainloader.dataset), {
             "status": "active",
