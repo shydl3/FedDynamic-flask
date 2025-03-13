@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import os
 from collections import defaultdict
 from model import Net
+import math
 
 # Create results directory
 os.makedirs("results", exist_ok=True)
@@ -60,103 +61,47 @@ def evaluate_global_model(parameters):
 class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.max_missed_rounds = 3
-        self.contribution_threshold = 0.7
+        
+        # Initialize client history tracking
+        self.client_history = {}  # Dictionary to track client participation
+        self.current_round = 0
+        self.verbose = True  # For logging reliability calculations
     
     def aggregate_fit(self, server_round, results, failures):
-        global_metrics["rounds"] = server_round
-        
-        if not results:
-            return None, {}
-        
-        # Process client contributions
-        processed_results = []
+        # Record successful clients
         for client_proxy, fit_res in results:
             client_id = client_proxy.cid
             
-            # Check for client metrics
-            if fit_res.metrics and "status" in fit_res.metrics:
-                status = fit_res.metrics["status"]
+            # Update client history with success
+            if client_id not in self.client_history:
+                self.client_history[client_id] = {"participation_records": []}
                 
-                # Process active clients
-                if status == "active":
-                    # Update client record
-                    if client_id not in global_metrics["client_status"]:
-                        global_metrics["client_status"][client_id] = {
-                            "active": True,
-                            "rounds_participated": 0,
-                            "rounds_missed": 0
-                        }
-                    
-                    client_status = global_metrics["client_status"][client_id]
-                    client_status["active"] = True
-                    client_status["rounds_participated"] += 1
-                    client_status["rounds_missed"] = 0
-                    
-                    # Save dataset size
-                    if "dataset_size" in fit_res.metrics:
-                        global_metrics["client_dataset_size"][client_id] = fit_res.metrics["dataset_size"]
-                    
-                    # Calculate contribution (using parameter norm)
-                    parameters = fl.common.parameters_to_ndarrays(fit_res.parameters)
-                    norm = np.linalg.norm(np.concatenate([p.flatten() for p in parameters]))
-                    
-                    # Track contribution
-                    global_metrics["client_contributions"][client_id].append(norm)
-                    
-                    # Keep this result for aggregation
-                    processed_results.append((client_proxy, fit_res))
-                    
-                # Handle failed clients
-                elif status == "failed":
-                    if client_id not in global_metrics["client_status"]:
-                        global_metrics["client_status"][client_id] = {
-                            "active": False,
-                            "rounds_participated": 0,
-                            "rounds_missed": 1
-                        }
-                    else:
-                        global_metrics["client_status"][client_id]["active"] = False
-                        global_metrics["client_status"][client_id]["rounds_missed"] += 1
-                    
-                    # Add zero contribution for visualization
-                    global_metrics["client_contributions"][client_id].append(0)
-                    
-                    print(f"⚠️ Client {client_id[:8]} failed in round {server_round}")
-        
-        # Normalize contribution lengths
-        max_contribs = max([len(contribs) for contribs in global_metrics["client_contributions"].values()], default=0)
-        for client_id in global_metrics["client_contributions"]:
-            while len(global_metrics["client_contributions"][client_id]) < max_contribs:
-                global_metrics["client_contributions"][client_id].append(0)
-        
-        # Handle cases with no valid results
-        if not processed_results:
-            print(f"❌ Round {server_round}: No valid client updates")
-            return None, {}
-        
-        # Use parent class for aggregation
-        parameters_aggregated, metrics = super().aggregate_fit(server_round, processed_results, failures)
-        
-        if parameters_aggregated is not None:
-            # Evaluate global model
-            ndarrays = fl.common.parameters_to_ndarrays(parameters_aggregated)
-            loss, accuracy = evaluate_global_model(ndarrays)
+            # Calculate contribution based on num_examples or other metric
+            contribution = fit_res.num_examples / max(sum(r.num_examples for _, r in results), 1)
             
-            # Store metrics
-            global_metrics["loss"].append(loss)
-            global_metrics["accuracy"].append(accuracy)
-            
-            # Track weight evolution
-            if len(ndarrays) > 0:
-                global_metrics["weights_evolution"].append(float(np.mean(ndarrays[0])))
-            
-            print(f"📊 Round {server_round}: Accuracy={accuracy:.4f}")
-            
-            # Update metrics
-            metrics["accuracy"] = accuracy
+            # Add successful participation record
+            self.client_history[client_id]["participation_records"].append({
+                "round": server_round,
+                "status": "success",
+                "contribution": contribution,
+            })
         
-        return parameters_aggregated, metrics
+        # Record failed clients
+        for client_proxy in failures:
+            client_id = client_proxy.cid
+            
+            # Update client history with failure
+            if client_id not in self.client_history:
+                self.client_history[client_id] = {"participation_records": []}
+                
+            # Add failure record
+            self.client_history[client_id]["participation_records"].append({
+                "round": server_round,
+                "status": "failure"
+            })
+        
+        # Continue with original aggregation logic
+        return super().aggregate_fit(server_round, results, failures)
     
     def configure_fit(self, server_round, parameters, client_manager):
         """Configure clients for training - handle rejoining clients"""
@@ -169,7 +114,7 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         
         # Check if any clients rejoined after failure
         for client_id, status in global_metrics["client_status"].items():
-            # Make sure the status dictionary has the required keys
+            # Initialize status if needed
             if "active" not in status:
                 status["active"] = True
             if "missed_rounds" not in status:
@@ -177,22 +122,86 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
             
             if status["active"] == False and client_id in available_clients:
                 # Client is rejoining
-                missed_rounds = status["missed_rounds"]
+                reliability_score, keep_weights = self.calculate_client_reliability_score(
+                    client_id, server_round
+                )
                 
-                # Decide if client can keep weights or not
-                if missed_rounds <= self.max_missed_rounds:
-                    # Client can keep its weights
-                    print(f"🔄 Client {client_id[:8]} rejoined after {missed_rounds} rounds - keeping weights")
+                if keep_weights:
+                    print(f"🔄 Client {client_id[:8]} rejoined - reliability: {reliability_score:.2f} - keeping weights")
                     config[client_id] = {"keep_weights": True}
                 else:
-                    # Client gets fresh weights
-                    print(f"🆕 Client {client_id[:8]} rejoined after {missed_rounds} rounds - resetting weights")
+                    print(f"🆕 Client {client_id[:8]} rejoined - reliability: {reliability_score:.2f} - resetting weights")
                     config[client_id] = {"keep_weights": False}
                 
                 # Mark as active again
                 status["active"] = True
         
         return super().configure_fit(server_round, parameters, client_manager)
+    
+    def calculate_client_reliability_score(self, client_id, current_round):
+        """
+        Calculate client reliability score using exponential time decay.
+        
+        Args:
+            self: The server instance
+            client_id: The client's identifier
+            current_round: Current training round number
+        """
+        # Get client history or initialize empty if new client
+        history = self.client_history.get(client_id, {"participation_records": []})
+        participation_records = history.get("participation_records", [])
+        
+        if not participation_records:
+            # For new clients, initialize their record and return default score
+            self.client_history[client_id] = {"participation_records": []}
+            return 0.5, False  # Default moderate reliability for new clients
+        
+        # Constants
+        decay_rate = 0.1  # Controls time decay (higher = faster decay)
+        max_history = 20  # Maximum rounds to consider
+        
+        # Initialize score components
+        reliability_score = 0.0
+        normalization_factor = 0.0
+        
+        # Process each historical record with exponential time decay
+        for record in sorted(participation_records[-max_history:], key=lambda x: x["round"]):
+            # Calculate time decay factor (more recent = more important)
+            time_diff = current_round - record["round"]
+            time_weight = math.exp(-decay_rate * time_diff)
+            
+            # Calculate impact based on record type
+            if record["status"] == "success":
+                # Successful participation: positive impact based on contribution
+                impact = 1.0 * (1.0 + min(1.0, record.get("contribution", 0.1) * 5.0))
+            elif record["status"] == "failure":
+                # Failed during training: significant negative impact
+                impact = -1.0
+            else:  # "missed"
+                # Missed round: moderate negative impact
+                impact = -0.5
+            
+            # Add weighted impact to score
+            reliability_score += impact * time_weight
+            normalization_factor += time_weight
+        
+        # Normalize to 0-1 range
+        if normalization_factor > 0:
+            # Transform from potentially negative values to 0-1 range
+            reliability_score = 0.5 + (reliability_score / (2 * normalization_factor))
+            reliability_score = max(0.0, min(1.0, reliability_score))
+        else:
+            reliability_score = 0.5
+        
+        # Determine whether to keep weights
+        last_seen = max([r["round"] for r in participation_records]) if participation_records else 0
+        rounds_missed = current_round - last_seen
+        
+        # Adaptive threshold based on absence duration
+        threshold = 0.6 * math.exp(-0.05 * rounds_missed)
+        keep_weights = reliability_score >= threshold
+        
+        return reliability_score, keep_weights
 
 # Function to create visualizations
 def create_visualizations():
