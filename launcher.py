@@ -1,134 +1,88 @@
-# launcher.py
-import argparse
 import subprocess
 import time
+import argparse
+import os
 import signal
 import sys
-import os
-import platform
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Launch Federated Learning System")
-parser.add_argument("--num-clients", type=int, default=3, help="Number of clients")
-parser.add_argument("--rounds", type=int, default=10, help="Number of federated learning rounds")
-parser.add_argument("--port", type=int, default=8080, help="Server port")
+# Parse arguments
+parser = argparse.ArgumentParser(description="Launch federated learning simulation")
+parser.add_argument("--num_clients", type=int, default=3, help="Number of clients")
+parser.add_argument("--rounds", type=int, default=10, help="Number of training rounds")
+parser.add_argument("--dataset_sizes", type=str, default="10000,20000,30000", 
+                   help="Comma-separated dataset sizes for each client")
+parser.add_argument("--fail_probs", type=str, default="0.2,0.1,0.3",
+                   help="Comma-separated failure probabilities")
+parser.add_argument("--recovery_probs", type=str, default="0.7,0.8,0.6",
+                   help="Comma-separated recovery probabilities")
 args = parser.parse_args()
 
-# List to keep track of processes
+# Create results directory
+os.makedirs("results", exist_ok=True)
+
+# Parse client parameters
+dataset_sizes = [int(x) for x in args.dataset_sizes.split(",")]
+fail_probs = [float(x) for x in args.fail_probs.split(",")]
+recovery_probs = [float(x) for x in args.recovery_probs.split(",")]
+
+# Ensure we have enough parameters for all clients
+while len(dataset_sizes) < args.num_clients:
+    dataset_sizes.append(10000)
+while len(fail_probs) < args.num_clients:
+    fail_probs.append(0.1)
+while len(recovery_probs) < args.num_clients:
+    recovery_probs.append(0.8)
+
+# Store all processes
 processes = []
 
-# Function to terminate processes on exit
-def cleanup_and_exit(signal=None, frame=None):
-    print("\n🛑 Terminating all processes...")
+def cleanup():
+    print("Cleaning up processes...")
     for p in processes:
-        try:
-            if platform.system() == 'Windows':
-                p.terminate()
-            else:
-                import os
-                os.kill(p.pid, signal.SIGKILL)
-            print(f"Process {p.pid} terminated")
-        except:
-            pass
-    print("Cleanup complete")
+        if p.poll() is None:  # If process is still running
+            p.terminate()
+
+# Handle Ctrl+C
+def signal_handler(sig, frame):
+    cleanup()
     sys.exit(0)
 
-# Register signal handlers for clean shutdown
-signal.signal(signal.SIGINT, cleanup_and_exit)
-signal.signal(signal.SIGTERM, cleanup_and_exit)
-
-# Create directories
-os.makedirs("results", exist_ok=True)
-os.makedirs("client_states", exist_ok=True)
-
-# Check Flower version and downgrade if needed
-try:
-    import flwr
-    flwr_version = flwr.__version__
-    print(f"Current Flower version: {flwr_version}")
-    
-    # If newer than 1.4.0, downgrade
-    if flwr_version > "1.4.0":
-        print("⚠️ Newer Flower version detected. Downgrading to 1.4.0...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "flwr==1.4.0"], check=True)
-        print("✅ Downgraded to Flower 1.4.0")
-        print("Please restart this script for the changes to take effect.")
-        sys.exit(0)
-except Exception as e:
-    print(f"Error checking/downgrading Flower version: {e}")
-    print("Proceeding with current installation...")
-
-# Client configurations
-client_configs = [
-    {"id": "client1", "dataset_size": 10000, "failure_prob": 0.1, "recovery_prob": 0.7},
-    {"id": "client2", "dataset_size": 20000, "failure_prob": 0.2, "recovery_prob": 0.5}, 
-    {"id": "client3", "dataset_size": 30000, "failure_prob": 0.05, "recovery_prob": 0.9}
-]
-
-# First clean up any existing state files to avoid KeyErrors
-print("🧹 Cleaning up old state files...")
-for config in client_configs:
-    state_file = f"client_states/client_{config['id']}.json"
-    if os.path.exists(state_file):
-        os.remove(state_file)
-        print(f"  Removed {state_file}")
-
-# Start the server
-print("🚀 Starting Federated Learning server...")
-server_cmd = [
-    sys.executable, "server.py",
-    "--rounds", str(args.rounds),
-    "--min-clients", "1",
-    "--port", str(args.port)
-]
-server_proc = subprocess.Popen(server_cmd)
-processes.append(server_proc)
-
-# Wait for server to initialize
-time.sleep(3)
-print(f"Server started on port {args.port}")
-
-# Start the clients
-print(f"🚀 Starting {args.num_clients} clients...")
-for i, config in enumerate(client_configs[:args.num_clients]):
-    print(f"  • Client {config['id']}: Dataset size={config['dataset_size']}, "
-          f"Failure prob={config['failure_prob']}, Recovery prob={config['recovery_prob']}")
-    
-    client_cmd = [
-        sys.executable, "client.py",
-        "--id", config["id"],
-        "--dataset-size", str(config["dataset_size"]),
-        "--failure-prob", str(config["failure_prob"]),
-        "--recovery-prob", str(config["recovery_prob"]),
-        "--server-address", f"127.0.0.1:{args.port}"
-    ]
-    
-    client_proc = subprocess.Popen(client_cmd)
-    processes.append(client_proc)
-    
-    # Small delay between client starts
-    time.sleep(1)
-
-print("\n✅ All processes started")
-print("Press Ctrl+C to stop the system")
+signal.signal(signal.SIGINT, signal_handler)
 
 try:
+    # Start server
+    print("🚀 Starting server...")
+    server_cmd = ["python", "server.py"]
+    server_process = subprocess.Popen(server_cmd)
+    processes.append(server_process)
+    
+    # Wait for server to initialize
+    time.sleep(2)
+    
+    # Start clients
+    for i in range(args.num_clients):
+        print(f"🚀 Starting client {i+1}...")
+        client_cmd = [
+            "python", "client.py",
+            "--client_id", f"client_{i+1}",
+            "--dataset_size", str(dataset_sizes[i]),
+            "--fail_prob", str(fail_probs[i]),
+            "--recovery_prob", str(recovery_probs[i])
+        ]
+        client_process = subprocess.Popen(client_cmd)
+        processes.append(client_process)
+        time.sleep(0.5)  # Small delay between starting clients
+    
+    print(f"✅ Started server and {args.num_clients} clients")
+    print("⏳ Training in progress...")
+    
     # Wait for server to complete
-    server_proc.wait()
-    print("✅ Server finished execution")
+    server_process.wait()
+    print("✅ Server has completed training")
     
-    # Server already handles visualization upon completion
-    
-    # Terminate remaining clients
-    for proc in processes[1:]:
-        if proc.poll() is None:  # If process is still running
-            if platform.system() == 'Windows':
-                proc.terminate()
-            else:
-                import os
-                os.kill(proc.pid, signal.SIGKILL)
-            
-except KeyboardInterrupt:
-    cleanup_and_exit()
+    # Terminate any remaining client processes
+    cleanup()
 
-print("🎉 Federated learning process completed!")
+except Exception as e:
+    print(f"Error: {e}")
+    cleanup()

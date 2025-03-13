@@ -1,190 +1,197 @@
-# server.py
-import os
-import argparse
 import flwr as fl
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-from model import Net
+import matplotlib.pyplot as plt
+import os
 from collections import defaultdict
+from model import Net
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Federated Learning Server")
-parser.add_argument("--rounds", type=int, default=10, help="Number of federated learning rounds")
-parser.add_argument("--min-clients", type=int, default=1, help="Minimum number of clients to start a round")
-parser.add_argument("--port", type=int, default=8080, help="Server port")
-args = parser.parse_args()
-
-# Create directory for results
+# Create results directory
 os.makedirs("results", exist_ok=True)
 
-# Global variables for tracking metrics
-global_loss = []
-global_acc = []
-weights_over_time = []
-client_contributions = defaultdict(list)
-client_status = {}  # Track client status (active/failed)
+# Global tracking variables
+global_metrics = {
+    "rounds": 0,
+    "loss": [],
+    "accuracy": [],
+    "weights_evolution": [],
+    "client_contributions": defaultdict(list),
+    "client_status": {},
+    "client_dataset_size": {}
+}
 
-# Evaluate global model on test dataset
+# Function to evaluate global model
 def evaluate_global_model(parameters):
-    """Evaluate the global model on the MNIST test dataset"""
-    # Device configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Initialize model
     model = Net().to(device)
     
     # Load parameters into model
-    state_dict = {}
     params_dict = zip(model.state_dict().keys(), parameters)
     state_dict = {k: torch.tensor(v) for k, v in params_dict}
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(state_dict, strict=False)
     
-    # Load test dataset
+    # Load test data
     transform = transforms.Compose([transforms.ToTensor()])
     testset = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
     testloader = torch.utils.data.DataLoader(testset, batch_size=32, shuffle=False)
     
-    # Evaluate model
+    # Evaluate
     model.eval()
-    loss_fn = torch.nn.CrossEntropyLoss()
-    correct, total, loss = 0, 0, 0.0
+    correct, total = 0, 0
+    loss = 0.0
     
     with torch.no_grad():
-        for images, labels in testloader:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss += loss_fn(outputs, labels).item()
+        for data, target in testloader:
+            data, target = data.to(device), target.to(device)
+            outputs = model(data)
             _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
     
     accuracy = correct / total
-    avg_loss = loss / len(testloader)
-    
-    return avg_loss, accuracy
+    return 0.0, accuracy  # Dummy loss, actual accuracy
 
-# Custom Federated Averaging Strategy
-class FedAvgWithFailures(fl.server.strategy.FedAvg):
+# Custom aggregation strategy
+class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.client_first_round = {}  # Track when each client first joined
-        self.client_last_round = {}   # Track the last round each client participated
-        self.client_properties = {}   # Track client properties
+        self.max_missed_rounds = 3
+        self.contribution_threshold = 0.7
     
     def aggregate_fit(self, server_round, results, failures):
-        """Aggregate client results and handle failures"""
+        global_metrics["rounds"] = server_round
+        
         if not results:
-            print(f"⚠️ Round {server_round} - No clients returned results")
             return None, {}
         
-        if failures:
-            print(f"⚠️ Round {server_round} - {len(failures)} clients failed")
-            for failure in failures:
-                if isinstance(failure, tuple) and len(failure) > 0:
-                    client_id = failure[0].cid
-                    client_status[client_id] = "failed"
-                    print(f"Client {client_id} failed")
+        # Process client contributions
+        processed_results = []
+        for client_proxy, fit_res in results:
+            client_id = client_proxy.cid
+            
+            # Check for client metrics
+            if fit_res.metrics and "status" in fit_res.metrics:
+                status = fit_res.metrics["status"]
+                
+                # Process active clients
+                if status == "active":
+                    # Update client record
+                    if client_id not in global_metrics["client_status"]:
+                        global_metrics["client_status"][client_id] = {
+                            "active": True,
+                            "rounds_participated": 0,
+                            "rounds_missed": 0
+                        }
+                    
+                    client_status = global_metrics["client_status"][client_id]
+                    client_status["active"] = True
+                    client_status["rounds_participated"] += 1
+                    client_status["rounds_missed"] = 0
+                    
+                    # Save dataset size
+                    if "dataset_size" in fit_res.metrics:
+                        global_metrics["client_dataset_size"][client_id] = fit_res.metrics["dataset_size"]
+                    
+                    # Calculate contribution (using parameter norm)
+                    parameters = fl.common.parameters_to_ndarrays(fit_res.parameters)
+                    norm = np.linalg.norm(np.concatenate([p.flatten() for p in parameters]))
+                    
+                    # Track contribution
+                    global_metrics["client_contributions"][client_id].append(norm)
+                    
+                    # Keep this result for aggregation
+                    processed_results.append((client_proxy, fit_res))
+                    
+                # Handle failed clients
+                elif status == "failed":
+                    if client_id not in global_metrics["client_status"]:
+                        global_metrics["client_status"][client_id] = {
+                            "active": False,
+                            "rounds_participated": 0,
+                            "rounds_missed": 1
+                        }
+                    else:
+                        global_metrics["client_status"][client_id]["active"] = False
+                        global_metrics["client_status"][client_id]["rounds_missed"] += 1
+                    
+                    # Add zero contribution for visualization
+                    global_metrics["client_contributions"][client_id].append(0)
+                    
+                    print(f"⚠️ Client {client_id[:8]} failed in round {server_round}")
         
-        # Process client results with weighted aggregation
-        weighted_results = []
-        total_weight = 0.0
+        # Normalize contribution lengths
+        max_contribs = max([len(contribs) for contribs in global_metrics["client_contributions"].values()], default=0)
+        for client_id in global_metrics["client_contributions"]:
+            while len(global_metrics["client_contributions"][client_id]) < max_contribs:
+                global_metrics["client_contributions"][client_id].append(0)
         
-        for client, fit_res in results:
-            client_id = client.cid
-            client_status[client_id] = "active"
-            
-            # Track first participation
-            if client_id not in self.client_first_round:
-                self.client_first_round[client_id] = server_round
-                print(f"New client joined: {client_id}")
-            
-            # Calculate missed rounds
-            missed_rounds = 0
-            if client_id in self.client_last_round:
-                missed_rounds = server_round - self.client_last_round[client_id] - 1
-            
-            # Update last active round
-            self.client_last_round[client_id] = server_round
-            
-            # Store client information
-            dataset_size = fit_res.num_examples
-            self.client_properties[client_id] = {"dataset_size": dataset_size}
-            
-            # Calculate weight based on dataset size and missed rounds
-            weight = dataset_size
-            if missed_rounds > 0:
-                # Apply penalty for missed rounds: exp(-missed/5)
-                missed_round_penalty = np.exp(-missed_rounds / 5)
-                weight = weight * missed_round_penalty
-                print(f"Client {client_id}: {dataset_size} samples, missed {missed_rounds} rounds, weight={weight:.2f}")
-            else:
-                print(f"Client {client_id}: {dataset_size} samples, no missed rounds, weight={weight:.2f}")
-            
-            total_weight += weight
-            weighted_results.append((client, fit_res, weight))
-            
-            # Track contribution for visualization
-            parameters = fl.common.parameters_to_ndarrays(fit_res.parameters)
-            norm = np.linalg.norm(np.concatenate([p.flatten() for p in parameters]))
-            
-            # Fill missing rounds with zeros
-            while len(client_contributions[client_id]) < server_round - 1:
-                client_contributions[client_id].append(0.0)
-            
-            # Add current contribution
-            client_contributions[client_id].append(norm)
+        # Handle cases with no valid results
+        if not processed_results:
+            print(f"❌ Round {server_round}: No valid client updates")
+            return None, {}
         
-        # Normalize weights
-        if total_weight > 0:
-            weighted_results = [(client, fit_res, weight / total_weight) 
-                               for client, fit_res, weight in weighted_results]
-        
-        # Aggregate parameters
-        parameters_aggregated = self._aggregate_fit_params(weighted_results)
+        # Use parent class for aggregation
+        parameters_aggregated, metrics = super().aggregate_fit(server_round, processed_results, failures)
         
         if parameters_aggregated is not None:
             # Evaluate global model
-            parameters_list = fl.common.parameters_to_ndarrays(parameters_aggregated)
-            loss, acc = evaluate_global_model(parameters_list)
-            print(f"📊 Round {server_round} - Global model evaluation: Loss={loss:.4f}, Accuracy={acc:.4f}")
+            ndarrays = fl.common.parameters_to_ndarrays(parameters_aggregated)
+            loss, accuracy = evaluate_global_model(ndarrays)
             
-            # Record metrics for visualization
-            global_loss.append(loss)
-            global_acc.append(acc)
+            # Store metrics
+            global_metrics["loss"].append(loss)
+            global_metrics["accuracy"].append(accuracy)
             
             # Track weight evolution
-            if len(parameters_list) > 0:
-                mean_weight = np.mean(parameters_list[0])
-                weights_over_time.append(mean_weight)
+            if len(ndarrays) > 0:
+                global_metrics["weights_evolution"].append(float(np.mean(ndarrays[0])))
             
-            # Fill in missing contribution data for visualization
-            for cid in client_contributions:
-                while len(client_contributions[cid]) < server_round:
-                    client_contributions[cid].append(0.0)
+            print(f"📊 Round {server_round}: Accuracy={accuracy:.4f}")
+            
+            # Update metrics
+            metrics["accuracy"] = accuracy
         
-        return parameters_aggregated, {}
+        return parameters_aggregated, metrics
     
-    def _aggregate_fit_params(self, results):
-        """Aggregate parameters using weighted average"""
-        weights_results = [
-            (fl.common.parameters_to_ndarrays(fit_res.parameters), weight)
-            for _, fit_res, weight in results
-        ]
+    def configure_fit(
+        self, server_round: int, parameters, client_manager
+    ):
+        """Configure clients for training - handle rejoining clients"""
         
-        return fl.common.ndarrays_to_parameters(
-            fl.common.aggregate.weighted_average(weights_results)
-        )
+        # Get all clients and their configuration
+        config = {}
+        
+        # Get all available client IDs
+        available_clients = [client.cid for client in client_manager.all()]
+        
+        # Check if any clients rejoined after failure
+        for client_id, status in global_metrics["client_status"].items():
+            if status["active"] == False and client_id in available_clients:
+                # Client is rejoining
+                missed_rounds = status["missed_rounds"]
+                
+                # Decide if client can keep weights or not
+                if missed_rounds <= self.max_missed_rounds:
+                    # Client can keep its weights
+                    print(f"🔄 Client {client_id[:8]} rejoined after {missed_rounds} rounds - keeping weights")
+                    config[client_id] = {"keep_weights": True}
+                else:
+                    # Client gets fresh weights
+                    print(f"🆕 Client {client_id[:8]} rejoined after {missed_rounds} rounds - resetting weights")
+                    config[client_id] = {"keep_weights": False}
+                
+                # Mark as active again
+                status["active"] = True
+        
+        return super().configure_fit(server_round, parameters, client_manager)
 
+# Function to create visualizations
 def create_visualizations():
-    """Generate and save visualization plots"""
-    print("Creating visualizations...")
-    
-    # 1. Global model loss over rounds
+    # 1. Plot global loss
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(global_loss) + 1), global_loss, marker='o')
+    plt.plot(range(1, len(global_metrics["loss"])+1), global_metrics["loss"], marker='o')
     plt.title("Global Model Loss over Rounds")
     plt.xlabel("Round")
     plt.ylabel("Loss")
@@ -192,9 +199,9 @@ def create_visualizations():
     plt.savefig("results/global_loss.png")
     plt.close()
     
-    # 2. Global model accuracy over rounds
+    # 2. Plot global accuracy
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(global_acc) + 1), global_acc, marker='o')
+    plt.plot(range(1, len(global_metrics["accuracy"])+1), global_metrics["accuracy"], marker='o')
     plt.title("Global Model Accuracy over Rounds")
     plt.xlabel("Round")
     plt.ylabel("Accuracy")
@@ -202,28 +209,31 @@ def create_visualizations():
     plt.savefig("results/global_accuracy.png")
     plt.close()
     
-    # 3. Weight evolution
+    # 3. Plot weight evolution
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(weights_over_time) + 1), weights_over_time, marker='o')
+    plt.plot(range(1, len(global_metrics["weights_evolution"])+1), global_metrics["weights_evolution"], marker='o')
     plt.title("Weight Evolution in Federated Learning")
     plt.xlabel("Round")
     plt.ylabel("Mean Weight Value")
     plt.grid(True)
-    plt.savefig("results/weight_evolution.png")
+    plt.savefig("results/weights_evolution.png")
     plt.close()
     
-    # 4. Client contributions
+    # 4. Plot client contributions
     plt.figure(figsize=(12, 7))
-    for client_id, contributions in client_contributions.items():
+    
+    for client_id, contributions in global_metrics["client_contributions"].items():
         rounds = range(1, len(contributions) + 1)
-        plt.plot(rounds, contributions, marker='o', label=f"Client {client_id[:6]}")
         
-        # Mark failures with red X
+        # Plot regular contributions
+        plt.plot(rounds, contributions, label=f"Client {client_id[:8]}", marker='o')
+        
+        # Mark rounds where client failed
         failed_rounds = [i+1 for i, c in enumerate(contributions) if c == 0]
         if failed_rounds:
-            plt.scatter(failed_rounds, [0] * len(failed_rounds), marker='x', color='red', s=100)
+            plt.scatter(failed_rounds, [0] * len(failed_rounds), color='red', s=80, marker='x', label=f"Client {client_id[:8]} failed" if client_id == list(global_metrics["client_contributions"].keys())[0] else "")
     
-    plt.title("Client Contributions Over Rounds")
+    plt.title("Client Contribution Over Rounds")
     plt.xlabel("Round")
     plt.ylabel("Contribution (Parameter Norm)")
     plt.grid(True)
@@ -231,37 +241,25 @@ def create_visualizations():
     plt.savefig("results/client_contributions.png")
     plt.close()
     
-    print("✅ Visualizations saved to 'results' directory")
+    print("✅ All visualizations saved to 'results' directory")
 
+# Main server function
 def main():
-    """Start the federated learning server"""
-    # Create a local model to provide initial parameters
-    initial_model = Net()
-    initial_parameters = [param.cpu().detach().numpy() for param in initial_model.parameters()]
-    
-    # Initialize custom strategy with initial parameters
-    strategy = FedAvgWithFailures(
-        fraction_fit=1.0,  # Use all available clients
-        min_fit_clients=args.min_clients,
-        min_available_clients=args.min_clients,
-        min_evaluate_clients=0,  # Skip evaluation for simplicity
-        initial_parameters=fl.common.ndarrays_to_parameters(initial_parameters),  # Add initial parameters
+    # Define strategy
+    strategy = FedAvgWithFailureHandling(
+        min_fit_clients=1,  # Proceed even with just one client
+        min_available_clients=1,
+        min_evaluate_clients=0
     )
-    
-    # Server configuration
-    server_config = fl.server.ServerConfig(num_rounds=args.rounds)
-    
-    print(f"🚀 Starting Federated Learning server on port {args.port}")
-    print(f"Running for {args.rounds} rounds with minimum {args.min_clients} clients")
     
     # Start server
     fl.server.start_server(
-        server_address=f"0.0.0.0:{args.port}",
-        config=server_config,
-        strategy=strategy,
+        server_address="0.0.0.0:8080",
+        config=fl.server.ServerConfig(num_rounds=10),
+        strategy=strategy
     )
     
-    # Create visualizations after training
+    # Create visualizations when done
     create_visualizations()
 
 if __name__ == "__main__":
