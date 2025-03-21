@@ -12,6 +12,10 @@ from matplotlib.lines import Line2D
 import logging
 import random
 import time
+import threading
+from flask import Flask, jsonify, render_template
+
+start_time = time.time()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
@@ -307,157 +311,125 @@ class FedAvgWithFailureHandling(fl.server.strategy.FedAvg):
         
         # Log rejoin event for debugging
         logger.info(f"REJOIN RECORDED: Client {client_id[:8]} in round {server_round}, keep_weights={keep_weights}")
-    
+
     def _fill_missing_rounds(self, current_round):
         """Fill in gaps for visualization continuity"""
         for client_id in global_metrics["expected_clients"]:
             reliability_data = global_metrics["client_reliability"].get(client_id, [])
             rounds_with_data = {entry["round"] for entry in reliability_data}
-            
+
             # Fill in any missing rounds from 1 to current
             for r in range(1, current_round + 1):
                 if r not in rounds_with_data:
                     # Find most recent entry before this round
                     prev_entries = [e for e in reliability_data if e["round"] < r]
-                    
+
                     if prev_entries:
                         # Get most recent entry
                         latest = max(prev_entries, key=lambda e: e["round"])
                         prev_reliability = latest.get("reliability", 0.5)
-                        
+
                         # Keep status consistent during failure periods
-                        status = "failure" if latest.get("status") == "failure" else "missed"
+                        if latest.get("status") == "failure":
+                            status = "failure"
+                        elif latest.get("status") == "rejoin":
+                            status = "success"  # After rejoin, assume success unless failure occurs
+                        else:
+                            status = "missed"
                     else:
                         prev_reliability = 0.5
                         status = "missed"
-                    
+
                     # Add entry with slightly degraded reliability
                     global_metrics["client_reliability"][client_id].append({
                         "round": r,
                         "reliability": max(0.1, prev_reliability - 0.05),
                         "status": status,
+                        "keep_weights": False,
                         "data_recovered": False
                     })
     
     def calculate_client_reliability_score(self, client_id, current_round):
-        """
-        Calculate the reliability score of a client using Bayesian updating.
-
-        Parameters:
-        - client_id: The identifier of the client.
-        - current_round: The current round number.
-
-        Returns:
-        - reliability_score: The final reliability score after weighting.
-        - keep_weights: Boolean indicating whether to keep the client's weights.
-        """
-        # Constants and parameters
-        reliability_threshold = 0.6  # Threshold for keeping weights
-        c = 1                        # Penalty constant for consecutive failures
-        alpha_0 = 1                  # Prior successes
-        beta_0 = 1                   # Prior failures
-
+        """Calculate client reliability score using exponential time decay with improved factors"""
         # Get client history
-        client_history = self.client_history.get(client_id, {"participation_records": [], "dataset_size": 0})
-        participation_records = client_history.get("participation_records", [])
-        dataset_size = client_history.get("dataset_size", 0)
-
+        history = self.client_history.get(client_id, {"participation_records": []})
+        participation_records = history.get("participation_records", [])
+        
         if not participation_records:
-            # No history, use prior mean reliability and average dataset size
-            reliability_score = alpha_0 / (alpha_0 + beta_0)
-            average_dataset_size = self.calculate_average_dataset_size()
-            if average_dataset_size > 0:
-                W_d = dataset_size / average_dataset_size if dataset_size > 0 else 1.0
-            else:
-                W_d = 1.0  # Default weighting if no data is available
-            reliability_score *= W_d
-            keep_weights = reliability_score >= reliability_threshold
-            return reliability_score, keep_weights
-
-        # Initialize counts
-        s = 0  # number of successes
-        f = 0  # number of failures
-        F_c = 0  # number of consecutive failures
-        max_consecutive_failures = 0  # to track the maximum consecutive failures
-
-        # Sort records by round in ascending order
-        sorted_records = sorted(participation_records, key=lambda x: x["round"])
-
-        # Process participation records
+            return 0.5, False  # Default moderate reliability for new clients
+        
+        # Constants
+        decay_rate = 0.15      # Slightly reduced decay rate for smoother transitions
+        max_history = 20       # Consider at most 20 recent records
+        base_success_impact = 0.5    # Base positive impact for successful participation 
+        failure_impact = -1.0        # Strong negative impact for failures
+        missed_impact = -0.5         # Moderate negative impact for missed rounds
+        dataset_factor = 0.3         # Weight factor for dataset size
+        reliability_threshold = 0.6  # Constant threshold for weight keeping
+        
+        # Calculate weighted score
+        reliability_score = 0.0
+        normalization_factor = 0.0
+        consecutive_failures = 0
+        
+        # Sort records by round to process them in chronological order
+        sorted_records = sorted(participation_records[-max_history:], key=lambda x: x["round"])
+        
         for record in sorted_records:
+            # Apply exponential time decay - more recent records count more
+            time_diff = current_round - record["round"]
+            time_weight = math.exp(-decay_rate * time_diff)
+            
+            # Calculate impact based on record type and properties
             if record["status"] == "success":
-                s += 1
-                F_c = 0  # reset consecutive failures
+                # For successful participation:
+                # 1. Base positive impact
+                # 2. Bonus based on dataset size (num_examples)
+                dataset_size = record.get("num_examples", 100)  # Default if not specified
+                dataset_bonus = min(1.0, dataset_size / 5000) * dataset_factor
+                impact = base_success_impact + dataset_bonus
+                consecutive_failures = 0  # Reset consecutive failures
             elif record["status"] == "failure":
-                f += 1
-                F_c += 1  # increment consecutive failures
-                if F_c > max_consecutive_failures:
-                    max_consecutive_failures = F_c
-            else:
-                # If status is unknown or missed, consider it as failure (adjust if needed)
-                f += 1
-                F_c += 1
-                if F_c > max_consecutive_failures:
-                    max_consecutive_failures = F_c
-
-        # Use the maximum consecutive failures for penalty
-        F_c_penalty = max_consecutive_failures
-
-        # Adjust beta for consecutive failures
-        beta_adjusted = beta_0 + f + c * F_c_penalty
-        alpha_posterior = alpha_0 + s
-        beta_posterior = beta_adjusted
-
-        # Compute posterior mean
-        reliability_score = alpha_posterior / (alpha_posterior + beta_posterior)
-
-        # Calculate average dataset size
-        average_dataset_size = self.calculate_average_dataset_size()
-
-        # Check for division by zero
-        if average_dataset_size > 0:
-            # Incorporate dataset size weighting
-            W_d = dataset_size / average_dataset_size if dataset_size > 0 else 1.0
-            W_d = min(W_d, 2.0)  # Optionally cap the weight to prevent extreme values
+                # For failures:
+                # 1. Negative impact
+                # 2. Additional penalty for consecutive failures
+                consecutive_failures += 1
+                consecutive_penalty = min(0.5, consecutive_failures * 0.1)  # Up to 0.5 extra penalty
+                impact = failure_impact - consecutive_penalty
+            else:  # missed or unknown
+                impact = missed_impact
+            
+            # Add weighted impact to score
+            reliability_score += impact * time_weight
+            normalization_factor += time_weight
+        
+        # Normalize to 0-1 range
+        if normalization_factor > 0:
+            # Center around 0.5, scale based on weighted impacts
+            reliability_score = 0.5 + (reliability_score / (3.0 * normalization_factor))
+            # Clamp to reasonable range, avoiding extreme values
+            reliability_score = max(0.05, min(0.95, reliability_score))
         else:
-            W_d = 1.0  # Default weighting if average dataset size is zero
-
-        reliability_score *= W_d
-
-        # Normalize reliability score to [0, 1]
-        reliability_score = min(max(reliability_score, 0.0), 1.0)
-
-        # Decision to keep weights
+            # Default value if no records to process
+            reliability_score = 0.5
+        
+        # Check if client has been absent too long
+        last_seen = max([r["round"] for r in participation_records]) if participation_records else 0
+        rounds_missed = current_round - last_seen
+        
+        # Log useful information
+        if self.verbose and random.random() < 0.2:  # Only log occasionally to reduce noise
+            logger.info(f"Client {client_id[:8]}: reliability={reliability_score:.3f}, missed={rounds_missed} rounds")
+        
+        # Use constant threshold as requested, but reduce reliability if client missed too many rounds
+        if rounds_missed > 3:
+            # Apply penalty for extended absence
+            reliability_score = max(0.05, reliability_score - (rounds_missed - 3) * 0.05)
+        
+        # Determine whether to keep weights based on constant threshold
         keep_weights = reliability_score >= reliability_threshold
-
-        # Optional logging for debugging
-        if self.verbose:
-            print(f"Client {client_id}: Reliability Score = {reliability_score:.4f}, Keep Weights = {keep_weights}")
-
+        
         return reliability_score, keep_weights
-
-    def calculate_average_dataset_size(self):
-        """
-        Calculate the average dataset size across all clients.
-
-        Returns:
-        - average_dataset_size: The average dataset size.
-        """
-        total_dataset_size = 0
-        num_clients = 0
-
-        for client_history in self.client_history.values():
-            dataset_size = client_history.get("dataset_size", 0)
-            if dataset_size > 0:
-                total_dataset_size += dataset_size
-                num_clients += 1
-
-        if num_clients > 0:
-            average_dataset_size = total_dataset_size / num_clients
-        else:
-            average_dataset_size = 0  # Default to zero if no dataset sizes are available
-
-        return average_dataset_size
 
 def print_client_summary():
     """Print summary of client participation"""
@@ -606,13 +578,71 @@ def create_visualizations():
     
     print("✅ All visualizations saved to 'results' directory")
 
+
+def start_dashboard_server():
+    """
+    runs a Flask server，retrieve realtime global_metrics (after each round)。
+    """
+    app = Flask(__name__)
+    app.config["GLOBAL_METRICS"] = global_metrics
+    app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # 禁用静态文件缓存
+
+    @app.route("/")
+    def index():
+        return render_template("index.html")
+
+    @app.route("/metrics")
+    def get_metrics():
+        # Calculate server uptime
+        elapsed_time = time.time() - start_time
+        hours = int(elapsed_time // 3600)
+        minutes = int((elapsed_time % 3600) // 60)
+        seconds = int(elapsed_time % 60)
+
+        # Get global_metrics
+        gm = app.config["GLOBAL_METRICS"]
+
+        gm_copy = dict(gm)
+        if isinstance(gm_copy.get("expected_clients"), set):
+            gm_copy["expected_clients"] = list(gm_copy["expected_clients"])
+
+        # Include all relevant fields in client_reliability
+        reliability_data = {
+            client_id: [
+                {
+                    "round": entry["round"],
+                    "reliability": entry["reliability"],
+                    "status": entry.get("status", "success"),  # Ensure status is included
+                    "keep_weights": entry.get("keep_weights", False)  # Ensure keep_weights is included
+                }
+                for entry in reliability
+            ]
+            for client_id, reliability in gm_copy.get("client_reliability", {}).items()
+        }
+        gm_copy["client_reliability"] = reliability_data
+
+        gm_copy["server_uptime"] = f"{hours}h {minutes}m {seconds}s"
+
+        return jsonify(gm_copy)
+
+
+    def run_flask():
+        app.run(host="127.0.0.1", port=80, debug=False)
+
+    # Flask thread runs at background
+    dashboard_thread = threading.Thread(target=run_flask, daemon=True)
+    dashboard_thread.start()
+    print("✅ Flask realtime dashboard is up，visit http://127.0.0.1:80/ to view the training process")
+
+
 def main():
     strategy = FedAvgWithFailureHandling(
         min_fit_clients=1,
         min_available_clients=1,
         min_evaluate_clients=0
     )
-    
+
+    start_dashboard_server()
     fl.server.start_server(
         server_address="0.0.0.0:8080",
         config=fl.server.ServerConfig(num_rounds=10),

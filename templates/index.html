@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Federated Learning Realtime Dashboard</title>
+    <script src="{{ url_for('static', filename='chart.js') }}"></script>
+    <style>
+        /* 全局样式 */
+        body {
+            text-align: center;
+            font-family: 'Arial', sans-serif;
+            background-color: #f4f7f6;
+            margin: 0;
+            padding: 0;
+        }
+
+        h1 {
+            color: #333;
+            font-size: 32px;
+            margin-top: 20px;
+        }
+
+        p {
+            font-size: 18px;
+            color: #666;
+        }
+
+        /* 服务器时间显示 */
+        #server-time {
+            background: #ff4d4d;
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+            padding: 10px 20px;
+            border-radius: 8px;
+            display: inline-block;
+            margin-top: 30px;
+            box-shadow: 0px 4px 6px rgba(0, 0, 0, 0.2);
+        }
+
+        /* 节点状态表格 */
+        #node-status {
+            margin-top: 20px;
+            margin-bottom: 50px;
+            display: flex;
+            justify-content: center;
+        }
+
+        #node-status table {
+            margin: auto;
+            border-collapse: collapse;
+            width: 80%;
+            max-width: 800px;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        #node-status th, #node-status td {
+            padding: 12px;
+            border: 1px solid #ddd;
+            text-align: center;
+        }
+
+        #node-status th {
+            background: #4CAF50;
+            color: white;
+        }
+
+        #node-status tr:nth-child(even) {
+            background: #f2f2f2;
+        }
+
+        #node-status tr:hover {
+            background: #ddd;
+        }
+
+        /* 图表容器 */
+        .chart-container {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 30px;
+            margin-top: 30px;
+            padding: 20px;
+        }
+
+        .chart-container div {
+            width: 100%;
+            max-width: 600px;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .legend-image {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            max-width: 100%;
+            padding: 10px;
+        }
+
+        .legend-image img {
+            width: 100%;
+            max-width: 500px; /* 设置最大宽度 */
+            height: auto; /* 保持图片比例 */
+            border-radius: 8px; /* 圆角 */
+            box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1); /* 添加阴影 */
+        }
+
+        canvas {
+            max-width: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Federated Learning Realtime Dashboard</h1>
+    <p>This webpage automatically pulls the metrics data from the backend every second.</p>
+    <p>The metrics data are updated after each round.</p>
+
+    <div id="server-time">Server Uptime: --h --m --s</div>
+
+    <div id="node-status"></div>
+
+    <div class="chart-container">
+        <div>
+            <canvas id="reliabilityChart"></canvas>
+        </div>
+        <div class="legend-image">
+            <img src="{{ url_for('static', filename='legend.png') }}" alt="Legend" />
+        </div>
+    </div>
+
+    <div class="chart-container">
+        <div>
+            <canvas id="accuracyChart"></canvas>
+        </div>
+        <div>
+            <canvas id="lossChart"></canvas>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
